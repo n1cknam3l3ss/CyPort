@@ -1,0 +1,72 @@
+name: Build libMacShim for iOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - pr-9
+      - main
+    paths:
+      - 'shim/**'
+      - '.github/workflows/build-shim.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-shim:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile MacShim for iOS
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SWIFTC="$(xcrun -f swiftc)"
+          TOOLCHAIN="$(dirname "$(dirname "$SWIFTC")")"
+          SWIFT_OBJECT="$RUNNER_TEMP/Launcher.o"
+
+          echo "==> Using iOS SDK: $SDK"
+          echo "==> Swift compiler: $SWIFTC"
+
+          "$SWIFTC" -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library \
+            -emit-object -module-name MacShimUI -wmo \
+            shim/Launcher.swift shim/StoresCore.swift shim/StoresUI.swift shim/GameCloud.swift \
+            -o "$SWIFT_OBJECT"
+
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 \
+            -L"$SDK/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/iphoneos" \
+            -Xlinker -rpath -Xlinker /usr/lib/swift \
+            -install_name @rpath/libMacShim.dylib \
+            -compatibility_version 9999.0.0 -current_version 9999.0.0 \
+            -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
+            -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal \
+            -framework UniformTypeIdentifiers -framework WebKit -lz \
+            -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics \
+            -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
+            shim/MacShim.m shim/MacShimC.c shim/StoreCodecs.c shim/third_party/lzma/LzmaDec.c \
+            "$SWIFT_OBJECT" -o "$RUNNER_TEMP/libMacShim.dylib"
+
+          mkdir -p dist
+          cp "$RUNNER_TEMP/libMacShim.dylib" dist/libMacShim.dylib
+          echo "libMacShim.dylib built successfully. Size: $(wc -c < dist/libMacShim.dylib) bytes"
+
+      - name: Upload libMacShim Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMacShim-dylib
+          path: dist/libMacShim.dylib
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete v2.5.0-shim --yes 2>/dev/null || true
+          gh release create v2.5.0-shim dist/libMacShim.dylib \
+            --title "libMacShim v2.5.0 (PR #9)" \
+            --notes "Compiled libMacShim.dylib with PR #9 support for Cyberpunk 2077 Steam 2.5.0 (AppKit stubs and 0x109cd3459 mouse gate)." \
+            --target "${{ github.sha }}" || true
