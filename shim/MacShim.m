@@ -4556,9 +4556,40 @@ static void MSInstallBackgroundFreeze(void) {
     }];
 }
 
+static void MSRedirectSaves(void) {
+    NSString *appSupport = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *appSupportSaves = [appSupport stringByAppendingPathComponent:@"CD Projekt Red/Cyberpunk 2077/saves"];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *docSaves = [docs stringByAppendingPathComponent:@"saves"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm createDirectoryAtPath:docSaves withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:[appSupportSaves stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    
+    NSDictionary *attr = [fm attributesOfItemAtPath:appSupportSaves error:nil];
+    if (attr) {
+        if (![attr[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            NSArray *items = [fm contentsOfDirectoryAtPath:appSupportSaves error:nil];
+            for (NSString *item in items) {
+                NSString *src = [appSupportSaves stringByAppendingPathComponent:item];
+                NSString *dst = [docSaves stringByAppendingPathComponent:item];
+                if (![fm fileExistsAtPath:dst]) {
+                    [fm moveItemAtPath:src toPath:dst error:nil];
+                }
+            }
+            [fm removeItemAtPath:appSupportSaves error:nil];
+            [fm createSymbolicLinkAtPath:appSupportSaves withDestinationPath:docSaves error:nil];
+            MSLogf(@"saves redirected: %@ -> %@", appSupportSaves, docSaves);
+        }
+    } else {
+        [fm createSymbolicLinkAtPath:appSupportSaves withDestinationPath:docSaves error:nil];
+        MSLogf(@"saves linked: %@ -> %@", appSupportSaves, docSaves);
+    }
+}
+
 __attribute__((constructor)) static void MSInit(void) {
     @autoreleasepool {
         MSOpenLog();
+        MSRedirectSaves();
         MSInstallFreeHook();
         MSInstallBackgroundFreeze();
         if (getenv("MACSHIM_PROBE_VA")) MSProbeVA();

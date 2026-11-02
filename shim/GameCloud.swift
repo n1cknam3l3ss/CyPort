@@ -456,18 +456,28 @@ enum SteamCloud {
     static func list() async throws -> [CloudFile] {
         try await SteamStore.shared.logOn()
         let cm = SteamStore.shared.cm
-        var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
-        let p = try await cm.call(.clientUFSGetFileListForApp, q)
-        let m = try PBMessage(p.body)
-        let prefixes = m.all(2).map { String(decoding: $0, as: UTF8.self) }
         var out: [CloudFile] = []
-        for raw in m.all(1) {
-            let f = try PBMessage(raw)
-            guard let name = f.s(2), (f.u(6) ?? 0) == 0 else { continue }              // skip deleted files
-            let prefix = f.u(8).flatMap { Int($0) < prefixes.count ? prefixes[Int($0)] : nil } ?? ""
-            guard let rel = GameCloud.slotPath(prefix + name) else { continue }
-            let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? 0))
-            out.append(CloudFile(rel: rel, modified: when, remote: prefix + name) { try await download(prefix.isEmpty ? [name] : [prefix + name, name]) })
+        do {
+            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, false)
+            let r = try await cm.service("Cloud.ClientGetFileList#1", q, authed: true)
+            for raw in r.all(1) {
+                let f = try PBMessage(raw)
+                guard let name = f.s(1) else { continue }
+                guard let rel = GameCloud.slotPath(name) else { continue }
+                let when = Date(timeIntervalSince1970: TimeInterval(f.u(3) ?? 0))
+                out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
+            }
+        } catch {
+            GameCloud.log("Steam: ClientGetFileList#1 failed (\(error.localizedDescription)), trying EnumerateUserFiles#1")
+            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true); q.u(3, 1000)
+            let r = try await cm.service("Cloud.EnumerateUserFiles#1", q, authed: true)
+            for raw in r.all(1) {
+                let f = try PBMessage(raw)
+                guard let name = f.s(1) else { continue }
+                guard let rel = GameCloud.slotPath(name) else { continue }
+                let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? f.u(3) ?? 0))
+                out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
+            }
         }
         GameCloud.log("Steam: \(out.count) save file(s) in Steam Cloud")
         return out
