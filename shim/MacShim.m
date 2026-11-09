@@ -1258,9 +1258,6 @@ static NSDictionary *MSConfig(void) {
             [merged addEntriesFromDictionary:userCfg];
         }
         c = [merged copy];
-        MSLogf(@"anti-crash config: MemSizeGB=%.1f, CompactPools=%d, StreamingMs=%.1f, Nodes=%ld",
-               [c[@"MemSizeGB"] doubleValue], [c[@"CompactPools"] boolValue],
-               [c[@"StreamingMsPerFrame"] doubleValue], (long)[c[@"StreamingNodesPerFrame"] integerValue]);
     });
     return c;
 }
@@ -4848,8 +4845,8 @@ int ms_BinkStartAsyncThread(int thread, const void *param) {
 
 static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)([MSConfig()[@"MemSizeGB"] doubleValue] * 1073741824.0); }
 __attribute__((constructor)) static void MSInstallMemSize(void) {
-    if ([MSConfig()[@"MemSizeGB"] doubleValue] <= 0) return;
-    method_setImplementation(class_getInstanceMethod(NSProcessInfo.class, @selector(physicalMemory)), (IMP)ms_physMem);
+    // Keep physicalMemory untouched for UIKit; ms_sysctlbyname hooks hw.memsize cleanly for REDengine.
+    return;
 }
 /* frame decoding: NoBinkDecode = YES skips it (frames stay as they are) - test for Bink writing past its buffers */
 int ms_BinkDoFrameAsyncMulti(void *bink, unsigned *threads, int n) __asm("_BinkDoFrameAsyncMulti");
