@@ -60,7 +60,14 @@ enum CloudSource: String, CaseIterable, Identifiable {
 enum GameCloud {
     static func log(_ s: String) { "cloud".withCString { a in s.withCString { MacShimLogC(a, $0) } } }
     static var appSupport: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
-    static var saves: URL { appSupport.appendingPathComponent("CD Projekt Red/Cyberpunk 2077/saves", isDirectory: true) }
+    static var docsDir: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
+    static var saves: URL {
+        let docSaves = docsDir.appendingPathComponent("saves", isDirectory: true)
+        if FileManager.default.fileExists(atPath: docSaves.path) {
+            return docSaves
+        }
+        return appSupport.appendingPathComponent("CD Projekt Red/Cyberpunk 2077/saves", isDirectory: true).resolvingSymlinksInPath()
+    }
 
     /// "…/CD Projekt Red/Cyberpunk 2077/ManualSave-3/sav.dat" -> "ManualSave-3/sav.dat" (nil if it isn't in a save slot)
     static func slotPath(_ path: String) -> String? {
@@ -79,13 +86,18 @@ enum GameCloud {
     struct LocalFile { let rel: String; let url: URL; let modified: Date }
     static func localFiles(in dir: URL = saves) -> [LocalFile] {
         let fm = FileManager.default
-        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]) else { return [] }
+        let baseDir = dir.resolvingSymlinksInPath()
+        guard let e = fm.enumerator(at: baseDir, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]) else { return [] }
         var out: [LocalFile] = []
+        let basePath = baseDir.standardizedFileURL.path
         for case let u as URL in e {
-            guard let v = try? u.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), v.isRegularFile == true else { continue }
-            let rel = String(u.standardizedFileURL.path.dropFirst(dir.standardizedFileURL.path.count + 1))
+            let realU = u.resolvingSymlinksInPath()
+            guard let v = try? realU.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), v.isRegularFile == true else { continue }
+            let itemPath = realU.standardizedFileURL.path
+            guard itemPath.hasPrefix(basePath) else { continue }
+            let rel = String(itemPath.dropFirst(basePath.count).drop(while: { $0 == "/" }))
             guard let comp = rel.split(separator: "/").first, isSlot(String(comp)), rel.contains("/"), !rel.contains("/.") else { continue }
-            out.append(LocalFile(rel: rel, url: u, modified: v.contentModificationDate ?? .distantPast))
+            out.append(LocalFile(rel: rel, url: realU, modified: v.contentModificationDate ?? .distantPast))
         }
         return out
     }
@@ -458,11 +470,11 @@ enum SteamCloud {
         let cm = SteamStore.shared.cm
         var out: [CloudFile] = []
         do {
-            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, false)
+            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
             let r = try await cm.service("Cloud.ClientGetFileList#1", q, authed: true)
             for raw in r.all(1) {
                 let f = try PBMessage(raw)
-                guard let name = f.s(1) else { continue }
+                guard let name = f.s(2) ?? f.s(7) ?? f.s(1) else { continue }
                 guard let rel = GameCloud.slotPath(name) else { continue }
                 let when = Date(timeIntervalSince1970: TimeInterval(f.u(3) ?? 0))
                 out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
@@ -473,7 +485,7 @@ enum SteamCloud {
             let r = try await cm.service("Cloud.EnumerateUserFiles#1", q, authed: true)
             for raw in r.all(1) {
                 let f = try PBMessage(raw)
-                guard let name = f.s(1) else { continue }
+                guard let name = f.s(2) ?? f.s(7) ?? f.s(1) else { continue }
                 guard let rel = GameCloud.slotPath(name) else { continue }
                 let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? f.u(3) ?? 0))
                 out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
@@ -489,11 +501,10 @@ enum SteamCloud {
         var remoteByRel: [String: String] = [:]
         for c in cloud { if let r = c.remote { remoteByRel[c.rel] = r } }
         // a new file goes where the existing saves are (same path prefix, e.g. "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/")
-        let prefix = cloud.lazy.compactMap { c in c.remote.flatMap { $0.hasSuffix(c.rel) ? String($0.dropLast(c.rel.count)) : nil } }.first
+        let prefix = cloud.lazy.compactMap { c in c.remote.flatMap { $0.hasSuffix(c.rel) ? String($0.dropLast(c.rel.count)) : nil } }.first ?? "CD Projekt Red/Cyberpunk 2077/"
         let named: [(GameCloud.LocalFile, String)] = try files.map { f in
             if let r = remoteByRel[f.rel] { return (f, r) }
-            guard let p = prefix else { throw StoreError("Steam Cloud has no Cyberpunk saves yet - play once on a computer with Steam first.") }
-            return (f, p + f.rel)
+            return (f, prefix + f.rel)
         }
         let cm = SteamStore.shared.cm, app = UInt64(Game.steamApp)
         var b = PBWriter(); b.u(1, app); b.s(2, "CyPort (iPhone)")
