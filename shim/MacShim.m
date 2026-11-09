@@ -1247,11 +1247,11 @@ static NSDictionary *MSConfig(void) {
         if (!userCfg) userCfg = [NSDictionary dictionaryWithContentsOfFile:[MSInternalRoot() stringByAppendingPathComponent:@"macshim.plist"]];
         
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:@{
-            @"MemSizeGB": @(5.0),
+            @"MemSizeGB": @(4.0),
             @"CompactPools": @YES,
             @"StreamingTweaks": @YES,
-            @"StreamingMsPerFrame": @(3.0),
-            @"StreamingNodesPerFrame": @(80),
+            @"StreamingMsPerFrame": @(2.0),
+            @"StreamingNodesPerFrame": @(40),
             @"PoolAlign": @YES
         }];
         if (userCfg) {
@@ -1628,12 +1628,15 @@ static void MSWriteStreamingIni(void) {
     NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
     if (old && ![old hasPrefix:mark]) { MSLogf(@"streaming: %@ is the user's own - left alone", p.lastPathComponent); return; }
     if ([MSConfig()[@"StreamingTweaks"] isEqual:@NO]) { if (old) [NSFileManager.defaultManager removeItemAtPath:p error:nil]; MSLogf(@"streaming: engine defaults (StreamingTweaks = NO)"); return; }
-    double ms = MSCfgD(@"StreamingMsPerFrame", 3.0); long nodes = (long)MSCfgD(@"StreamingNodesPerFrame", 80);
+    double ms = MSCfgD(@"StreamingMsPerFrame", 2.0); long nodes = (long)MSCfgD(@"StreamingNodesPerFrame", 40);
     NSString *ini = [NSString stringWithFormat:@"%@ (written by CyPort at every start - delete this line to keep your own edits)\n"
-                     "; engine defaults 12 ms / 300 nodes per frame; spread over more frames for steadier FPS and lower peak RAM\n"
-                     "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\nMinFreeMemory = 500\nDistanceBoost = 0.0\n\n"
+                     "; low-memory & anti-stutter tweaks for iOS unified memory\n"
+                     "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\nMinFreeMemory = 800\nDistanceBoost = 0.0\n\n"
                      "[Streaming/Editor]\nDistanceBoost = 0.0\n\n"
-                     "[ResourcePools]\nResourcePoolAlloc = 0\n", mark, ms, nodes];
+                     "[ResourcePools]\nResourcePoolAlloc = 0\n\n"
+                     "[Editor/MipBias]\nEnableCustomMipBias = true\nForceCustomMipBias = 1.0\n\n"
+                     "[Traffic]\nStopSpawn = true\n\n"
+                     "[Developer/FeatureToggles]\nVolumetricClouds = false\nVolumetricFog = false\nDistantVolFog = false\n", mark, ms, nodes];
     if ([old isEqualToString:ini]) return;
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);

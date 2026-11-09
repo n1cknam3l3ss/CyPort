@@ -319,15 +319,15 @@
                 {
                     "name": "SlowHDD",
                     "type": "bool",
-                    "value": false,
+                    "value": true,
                     "default_value": false
                 },
                 {
                     "name": "HDDMode",
                     "type": "name_list",
                     "is_dynamic": false,
-                    "value": "Auto",
-                    "index": 2,
+                    "value": "On",
+                    "index": 1,
                     "default_index": 2,
                     "values": [
                         "Off",
