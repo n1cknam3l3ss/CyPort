@@ -4567,7 +4567,14 @@ static void MSRedirectSaves(void) {
     
     NSDictionary *attr = [fm attributesOfItemAtPath:appSupportSaves error:nil];
     if (attr) {
-        if (![attr[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+        if ([attr[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            NSString *curDest = [fm destinationOfSymbolicLinkAtPath:appSupportSaves error:nil];
+            if (![curDest isEqualToString:docSaves]) {
+                [fm removeItemAtPath:appSupportSaves error:nil];
+                [fm createSymbolicLinkAtPath:appSupportSaves withDestinationPath:docSaves error:nil];
+                MSLogf(@"saves symlink refreshed: %@ -> %@", appSupportSaves, docSaves);
+            }
+        } else {
             NSArray *items = [fm contentsOfDirectoryAtPath:appSupportSaves error:nil];
             for (NSString *item in items) {
                 NSString *src = [appSupportSaves stringByAppendingPathComponent:item];
