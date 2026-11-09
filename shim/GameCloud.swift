@@ -553,7 +553,8 @@ enum SteamCloud {
                         var h: [String: String] = [:]
                         for hr in blk.all(5) { if let hm = try? PBMessage(hr), let k = hm.s(1), let v = hm.s(2) { h[k] = v } }
                         let method = ["", "GET", "HEAD", "POST", "PUT", "DELETE"][min(5, Int(blk.u(4) ?? 4))]
-                        guard let u = URL(string: "\((blk.u(3) ?? 1) != 0 ? \"https\" : \"http\")://\(host)\(path)") else { throw StoreError("Steam Cloud: bad upload address") }
+                        let scheme = (blk.u(3) ?? 1) != 0 ? "https" : "http"
+                        guard let u = URL(string: "\(scheme)://\(host)\(path)") else { throw StoreError("Steam Cloud: bad upload address") }
                         _ = try await Net.request(u, method: method.isEmpty ? "PUT" : method, headers: h, body: body)
                     }
                     var c = PBWriter(); c.b(1, true); c.u(2, app); c.bytes(3, sha); c.s(4, name)
