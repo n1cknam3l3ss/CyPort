@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-shim:
-    runs-on: macos-15-intel
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
