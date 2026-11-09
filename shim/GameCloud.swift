@@ -469,28 +469,44 @@ enum SteamCloud {
         try await SteamStore.shared.logOn()
         let cm = SteamStore.shared.cm
         var out: [CloudFile] = []
+
+        // 1. Unified service: Cloud.EnumerateUserFiles#1
         do {
-            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
-            let r = try await cm.service("Cloud.ClientGetFileList#1", q, authed: true)
-            for raw in r.all(1) {
-                let f = try PBMessage(raw)
-                guard let name = f.s(2) ?? f.s(7) ?? f.s(1) else { continue }
-                guard let rel = GameCloud.slotPath(name) else { continue }
-                let when = Date(timeIntervalSince1970: TimeInterval(f.u(3) ?? 0))
-                out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
-            }
-        } catch {
-            GameCloud.log("Steam: ClientGetFileList#1 failed (\(error.localizedDescription)), trying EnumerateUserFiles#1")
             var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true); q.u(3, 1000)
             let r = try await cm.service("Cloud.EnumerateUserFiles#1", q, authed: true)
             for raw in r.all(1) {
                 let f = try PBMessage(raw)
-                guard let name = f.s(2) ?? f.s(7) ?? f.s(1) else { continue }
+                // In CCloud_UserFile: field 3 is filename, field 4 is timestamp
+                guard let name = f.s(3) ?? f.s(2) ?? f.s(1) else { continue }
                 guard let rel = GameCloud.slotPath(name) else { continue }
                 let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? f.u(3) ?? 0))
                 out.append(CloudFile(rel: rel, modified: when, remote: name) { try await download([name]) })
             }
+        } catch {
+            GameCloud.log("Steam: EnumerateUserFiles#1 failed (\(error.localizedDescription))")
         }
+
+        // 2. Fallback: clientUFSGetFileListForApp (EMsg 5206)
+        if out.isEmpty {
+            do {
+                var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
+                let p = try await cm.call(.clientUFSGetFileListForApp, q)
+                let m = try PBMessage(p.body)
+                let prefixes = m.all(2).map { String(decoding: $0, as: UTF8.self) }
+                for raw in m.all(1) {
+                    let f = try PBMessage(raw)
+                    guard let name = f.s(2), (f.u(6) ?? 0) == 0 else { continue }              // skip deleted files
+                    let prefix = f.u(8).flatMap { Int($0) < prefixes.count ? prefixes[Int($0)] : nil } ?? ""
+                    let fullName = prefix + name
+                    guard let rel = GameCloud.slotPath(fullName) else { continue }
+                    let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? 0))
+                    out.append(CloudFile(rel: rel, modified: when, remote: fullName) { try await download(prefix.isEmpty ? [name] : [fullName, name]) })
+                }
+            } catch {
+                GameCloud.log("Steam: clientUFSGetFileListForApp failed (\(error.localizedDescription))")
+            }
+        }
+
         GameCloud.log("Steam: \(out.count) save file(s) in Steam Cloud")
         return out
     }
@@ -509,8 +525,14 @@ enum SteamCloud {
         let cm = SteamStore.shared.cm, app = UInt64(Game.steamApp)
         var b = PBWriter(); b.u(1, app); b.s(2, "CyPort (iPhone)")
         for (_, n) in named { b.s(3, n) }
-        let batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0
+        var batch: UInt64 = 0
+        do {
+            batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0
+        } catch let e as SteamResult where e.code == 29 {
+            GameCloud.log("Steam: BeginAppUploadBatch duplicate (result 29), continuing with batch 0")
+        }
         func complete(_ ok: Bool) async {
+            guard batch != 0 else { return }
             var c = PBWriter(); c.u(1, app); c.u(2, batch); c.u(3, ok ? 1 : 2)
             _ = try? await cm.service("Cloud.CompleteAppUploadBatchBlocking#1", c, authed: true)
         }
@@ -521,26 +543,31 @@ enum SteamCloud {
                 q.u(1, app); q.u(2, UInt64(data.count)); q.u(3, UInt64(data.count)); q.bytes(4, sha)
                 q.u(5, UInt64(max(0, f.modified.timeIntervalSince1970))); q.s(6, name); q.u(7, 0xFFFF_FFFF)
                 q.b(10, false); q.u(13, batch)
-                let r = try await cm.service("Cloud.ClientBeginFileUpload#1", q, authed: true)
-                for raw in r.all(2) {
-                    let blk = try PBMessage(raw)
-                    guard let host = blk.s(1), let path = blk.s(2) else { throw StoreError("Steam Cloud gave no upload address") }
-                    let off = Int(blk.u(6) ?? 0), len = Int(blk.u(7) ?? UInt64(data.count))
-                    let body = blk.data(8) ?? data.subdata(in: off..<min(data.count, off + len))
-                    var h: [String: String] = [:]
-                    for hr in blk.all(5) { if let hm = try? PBMessage(hr), let k = hm.s(1), let v = hm.s(2) { h[k] = v } }
-                    let method = ["", "GET", "HEAD", "POST", "PUT", "DELETE"][min(5, Int(blk.u(4) ?? 4))]
-                    guard let u = URL(string: "\((blk.u(3) ?? 1) != 0 ? "https" : "http")://\(host)\(path)") else { throw StoreError("Steam Cloud: bad upload address") }
-                    _ = try await Net.request(u, method: method.isEmpty ? "PUT" : method, headers: h, body: body)
+                do {
+                    let r = try await cm.service("Cloud.ClientBeginFileUpload#1", q, authed: true)
+                    for raw in r.all(2) {
+                        let blk = try PBMessage(raw)
+                        guard let host = blk.s(1), let path = blk.s(2) else { throw StoreError("Steam Cloud gave no upload address") }
+                        let off = Int(blk.u(6) ?? 0), len = Int(blk.u(7) ?? UInt64(data.count))
+                        let body = blk.data(8) ?? data.subdata(in: off..<min(data.count, off + len))
+                        var h: [String: String] = [:]
+                        for hr in blk.all(5) { if let hm = try? PBMessage(hr), let k = hm.s(1), let v = hm.s(2) { h[k] = v } }
+                        let method = ["", "GET", "HEAD", "POST", "PUT", "DELETE"][min(5, Int(blk.u(4) ?? 4))]
+                        guard let u = URL(string: "\((blk.u(3) ?? 1) != 0 ? \"https\" : \"http\")://\(host)\(path)") else { throw StoreError("Steam Cloud: bad upload address") }
+                        _ = try await Net.request(u, method: method.isEmpty ? "PUT" : method, headers: h, body: body)
+                    }
+                    var c = PBWriter(); c.b(1, true); c.u(2, app); c.bytes(3, sha); c.s(4, name)
+                    let committed = try await cm.service("Cloud.ClientCommitFileUpload#1", c, authed: true)
+                    guard (committed.u(1) ?? 0) != 0 else { throw StoreError("Steam Cloud didn't accept \(f.rel)") }
+                } catch let e as SteamResult where e.code == 29 {
+                    GameCloud.log("Steam: file \(name) already exists on cloud (result 29), skipped")
                 }
-                var c = PBWriter(); c.b(1, true); c.u(2, app); c.bytes(3, sha); c.s(4, name)
-                let committed = try await cm.service("Cloud.ClientCommitFileUpload#1", c, authed: true)
-                guard (committed.u(1) ?? 0) != 0 else { throw StoreError("Steam Cloud didn't accept \(f.rel)") }
             }
         } catch { await complete(false); throw error }
         await complete(true)
         GameCloud.log("Steam: sent \(named.count) file(s)")
     }
+
 
     private static func download(_ names: [String]) async throws -> Data {
         var last: Error = StoreError("Steam Cloud: no file")
