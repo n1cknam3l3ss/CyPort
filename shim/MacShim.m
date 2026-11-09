@@ -1635,7 +1635,6 @@ static void MSWriteStreamingIni(void) {
                      "[Streaming/Editor]\nDistanceBoost = 0.0\n\n"
                      "[ResourcePools]\nResourcePoolAlloc = 0\n\n"
                      "[Editor/MipBias]\nEnableCustomMipBias = true\nForceCustomMipBias = 1.0\n\n"
-                     "[Traffic]\nStopSpawn = true\n\n"
                      "[Developer/FeatureToggles]\nVolumetricClouds = false\nVolumetricFog = false\nDistantVolFog = false\n", mark, ms, nodes];
     if ([old isEqualToString:ini]) return;
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
