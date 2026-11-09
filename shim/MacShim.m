@@ -1243,8 +1243,24 @@ static NSDictionary *MSConfig(void) {
     static NSDictionary *c; static dispatch_once_t o;
     dispatch_once(&o, ^{
         NSString *p = [(MSDataRoot() ?: MSInternalRoot()) stringByAppendingPathComponent:@"macshim.plist"];
-        c = [NSDictionary dictionaryWithContentsOfFile:p];
-        if (!c) c = [NSDictionary dictionaryWithContentsOfFile:[MSInternalRoot() stringByAppendingPathComponent:@"macshim.plist"]] ?: @{};
+        NSDictionary *userCfg = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (!userCfg) userCfg = [NSDictionary dictionaryWithContentsOfFile:[MSInternalRoot() stringByAppendingPathComponent:@"macshim.plist"]];
+        
+        NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"MemSizeGB": @(5.0),
+            @"CompactPools": @YES,
+            @"StreamingTweaks": @YES,
+            @"StreamingMsPerFrame": @(3.0),
+            @"StreamingNodesPerFrame": @(80),
+            @"PoolAlign": @YES
+        }];
+        if (userCfg) {
+            [merged addEntriesFromDictionary:userCfg];
+        }
+        c = [merged copy];
+        MSLogf(@"anti-crash config: MemSizeGB=%.1f, CompactPools=%d, StreamingMs=%.1f, Nodes=%ld",
+               [c[@"MemSizeGB"] doubleValue], [c[@"CompactPools"] boolValue],
+               [c[@"StreamingMsPerFrame"] doubleValue], (long)[c[@"StreamingNodesPerFrame"] integerValue]);
     });
     return c;
 }
@@ -1586,6 +1602,15 @@ static BOOL MSApplyFrameRate(NSMutableString *txt) {
  * desktop CPU; on a phone (throttled, at 30 FPS = 33 ms per frame) that much in one frame is the FPS drop you see while
  * driving. Spread over more frames instead: steadier frame times, things appear a little later. Loading screens keep
  * the engine's own limits. The file is CyPort's while its first line says so; StreamingTweaks = NO removes it. */
+static void MSPrepareModDirs(void) {
+    NSString *root = g_root; if (!root) return;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *pcMod = [root stringByAppendingPathComponent:@"archive/pc/mod"];
+    NSString *macMod = [root stringByAppendingPathComponent:@"archive/mac/mod"];
+    [fm createDirectoryAtPath:pcMod withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:macMod withIntermediateDirectories:YES attributes:nil error:nil];
+}
+
 static void MSWriteStreamingIni(void) {
     NSString *root = g_root; if (!root) return;
     NSString *dir = [root stringByAppendingPathComponent:@"engine/config/platform/mac"], *p = [dir stringByAppendingPathComponent:@"user.ini"];
@@ -1593,14 +1618,25 @@ static void MSWriteStreamingIni(void) {
     NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
     if (old && ![old hasPrefix:mark]) { MSLogf(@"streaming: %@ is the user's own - left alone", p.lastPathComponent); return; }
     if ([MSConfig()[@"StreamingTweaks"] isEqual:@NO]) { if (old) [NSFileManager.defaultManager removeItemAtPath:p error:nil]; MSLogf(@"streaming: engine defaults (StreamingTweaks = NO)"); return; }
-    double ms = MSCfgD(@"StreamingMsPerFrame", 6); long nodes = (long)MSCfgD(@"StreamingNodesPerFrame", 200);
+    double ms = MSCfgD(@"StreamingMsPerFrame", 3.0); long nodes = (long)MSCfgD(@"StreamingNodesPerFrame", 80);
     NSString *ini = [NSString stringWithFormat:@"%@ (written by CyPort at every start - delete this line to keep your own edits)\n"
-                     "; engine defaults 12 ms / 300 nodes per frame; spread over more frames for steadier FPS in the open world\n"
-                     "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\n", mark, ms, nodes];
-    if ([old isEqualToString:ini]) return;
-    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
-    else MSLogf(@"streaming: could not write %@", p);
+                     "; engine defaults 12 ms / 300 nodes per frame; spread over more frames for steadier FPS and lower peak RAM\n"
+                     "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\nMinFreeMemory = 500\nDistanceBoost = 0.0\n\n"
+                     "[Streaming/Editor]\nDistanceBoost = 0.0\n\n"
+                     "[ResourcePools]\nResourcePoolAlloc = 0\n", mark, ms, nodes];
+    if (![old isEqualToString:ini]) {
+        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
+        else MSLogf(@"streaming: could not write %@", p);
+    }
+    NSString *dirPC = [root stringByAppendingPathComponent:@"engine/config/platform/pc"], *pPC = [dirPC stringByAppendingPathComponent:@"user.ini"];
+    NSString *oldPC = [NSString stringWithContentsOfFile:pPC encoding:NSUTF8StringEncoding error:nil];
+    if (!oldPC || [oldPC hasPrefix:mark]) {
+        if (![oldPC isEqualToString:ini]) {
+            [NSFileManager.defaultManager createDirectoryAtPath:dirPC withIntermediateDirectories:YES attributes:nil error:nil];
+            [ini writeToFile:pPC atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
 }
 /* ---------------------------------------------------------------- steady 30 (the game's dynamic resolution)
  * Hot, the A18 Pro's GPU slows to ~1/3 of its cool speed: at a fixed MetalFX Performance (50 %) the city then takes
@@ -1675,6 +1711,7 @@ static BOOL MSApplySteady30(NSMutableString *txt) {
 }
 static BOOL MSSmoothOn(void);
 static void MSApplyGameSettings(NSSet *keys) {
+    MSPrepareModDirs();
     MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
        the file stays byte for byte as the game wrote it. Re-serialising the whole file (NSJSONSerialization escapes every
