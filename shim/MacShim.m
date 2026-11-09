@@ -1599,13 +1599,26 @@ static BOOL MSApplyFrameRate(NSMutableString *txt) {
  * desktop CPU; on a phone (throttled, at 30 FPS = 33 ms per frame) that much in one frame is the FPS drop you see while
  * driving. Spread over more frames instead: steadier frame times, things appear a little later. Loading screens keep
  * the engine's own limits. The file is CyPort's while its first line says so; StreamingTweaks = NO removes it. */
-static void MSPrepareModDirs(void) {
+static void MSCleanupConflictingCase(void) {
     NSString *root = g_root; if (!root) return;
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *pcMod = [root stringByAppendingPathComponent:@"archive/pc/mod"];
-    NSString *macMod = [root stringByAppendingPathComponent:@"archive/mac/mod"];
-    [fm createDirectoryAtPath:pcMod withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:macMod withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *archive = [root stringByAppendingPathComponent:@"archive"];
+    NSString *macLower = [archive stringByAppendingPathComponent:@"mac"];
+    NSString *macUpper = [archive stringByAppendingPathComponent:@"Mac"];
+    if ([fm fileExistsAtPath:macLower] && [fm fileExistsAtPath:[macUpper stringByAppendingPathComponent:@"content"]]) {
+        if (![fm fileExistsAtPath:[macLower stringByAppendingPathComponent:@"content"]]) {
+            [fm removeItemAtPath:macLower error:nil];
+            MSLogf(@"cleaned up conflicting empty lowercase archive/mac folder");
+        }
+    }
+    NSString *pcLower = [archive stringByAppendingPathComponent:@"pc"];
+    NSString *pcUpper = [archive stringByAppendingPathComponent:@"PC"];
+    if ([fm fileExistsAtPath:pcLower] && [fm fileExistsAtPath:[pcUpper stringByAppendingPathComponent:@"content"]]) {
+        if (![fm fileExistsAtPath:[pcLower stringByAppendingPathComponent:@"content"]]) {
+            [fm removeItemAtPath:pcLower error:nil];
+            MSLogf(@"cleaned up conflicting empty lowercase archive/pc folder");
+        }
+    }
 }
 
 static void MSWriteStreamingIni(void) {
@@ -1621,19 +1634,10 @@ static void MSWriteStreamingIni(void) {
                      "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\nMinFreeMemory = 500\nDistanceBoost = 0.0\n\n"
                      "[Streaming/Editor]\nDistanceBoost = 0.0\n\n"
                      "[ResourcePools]\nResourcePoolAlloc = 0\n", mark, ms, nodes];
-    if (![old isEqualToString:ini]) {
-        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
-        else MSLogf(@"streaming: could not write %@", p);
-    }
-    NSString *dirPC = [root stringByAppendingPathComponent:@"engine/config/platform/pc"], *pPC = [dirPC stringByAppendingPathComponent:@"user.ini"];
-    NSString *oldPC = [NSString stringWithContentsOfFile:pPC encoding:NSUTF8StringEncoding error:nil];
-    if (!oldPC || [oldPC hasPrefix:mark]) {
-        if (![oldPC isEqualToString:ini]) {
-            [NSFileManager.defaultManager createDirectoryAtPath:dirPC withIntermediateDirectories:YES attributes:nil error:nil];
-            [ini writeToFile:pPC atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-    }
+    if ([old isEqualToString:ini]) return;
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
+    else MSLogf(@"streaming: could not write %@", p);
 }
 /* ---------------------------------------------------------------- steady 30 (the game's dynamic resolution)
  * Hot, the A18 Pro's GPU slows to ~1/3 of its cool speed: at a fixed MetalFX Performance (50 %) the city then takes
@@ -1708,7 +1712,7 @@ static BOOL MSApplySteady30(NSMutableString *txt) {
 }
 static BOOL MSSmoothOn(void);
 static void MSApplyGameSettings(NSSet *keys) {
-    MSPrepareModDirs();
+    MSCleanupConflictingCase();
     MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
        the file stays byte for byte as the game wrote it. Re-serialising the whole file (NSJSONSerialization escapes every
