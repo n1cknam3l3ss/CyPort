@@ -33,6 +33,27 @@ enum StoreKind: String, CaseIterable, Identifiable {
     }
 }
 
+struct LangOption: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let detail: String
+    let isDefault: Bool
+}
+
+let availableLanguages: [LangOption] = [
+    LangOption(id: "english", name: "English", detail: "Full Audio and Text · Required (Base + Phantom Liberty)", isDefault: true),
+    LangOption(id: "russian", name: "Русский (Russian)", detail: "Полная озвучка базы + текст «Призрачной свободы» (официальной озвучки DLC нет)", isDefault: false),
+    LangOption(id: "polish", name: "Polski (Polish)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "german", name: "Deutsch (German)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "french", name: "Français (French)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "spanish", name: "Español (Spanish)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "italian", name: "Italiano (Italian)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "japanese", name: "日本語 (Japanese)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "schinese", name: "简体中文 (Simplified Chinese)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "koreana", name: "한국어 (Korean)", detail: "Full Audio and Text", isDefault: false),
+    LangOption(id: "brazilian", name: "Português do Brasil", detail: "Full Audio and Text", isDefault: false)
+]
+
 @MainActor
 final class StoreModel: ObservableObject {
     enum Phase { case choose, preparing(String), ready, downloading, done(String), failed(String) }
@@ -48,10 +69,47 @@ final class StoreModel: ObservableObject {
     @Published var progress: Downloader.Progress?
     @Published var needBytes: Int64 = 0
     @Published var freeBytes: Int64 = 0
+    @Published var selectedLanguages: Set<String> = ["english"]
+    @Published var hasPhantomLiberty: Bool = false
     private var task: Task<Void, Never>?
+
+    static func detectSystemLanguage() -> String? {
+        let langs = Locale.preferredLanguages
+        for lang in langs {
+            let l = lang.lowercased()
+            if l.hasPrefix("ru") { return "russian" }
+            if l.hasPrefix("pl") { return "polish" }
+            if l.hasPrefix("de") { return "german" }
+            if l.hasPrefix("fr") { return "french" }
+            if l.hasPrefix("es") { return "spanish" }
+            if l.hasPrefix("it") { return "italian" }
+            if l.hasPrefix("ja") { return "japanese" }
+            if l.hasPrefix("zh") { return "schinese" }
+            if l.hasPrefix("ko") { return "koreana" }
+            if l.hasPrefix("pt") { return "brazilian" }
+        }
+        return nil
+    }
+
+    func toggleLanguage(_ id: String) {
+        guard id != "english" else { return }
+        if selectedLanguages.contains(id) {
+            selectedLanguages.remove(id)
+        } else {
+            selectedLanguages.insert(id)
+        }
+        if let s = store {
+            prepare(s)
+        }
+    }
 
     init(downloadRoot: URL, internalRoot: URL, bookmarkKey: String) {
         self.downloadRoot = downloadRoot; self.internalRoot = internalRoot; self.bookmarkKey = bookmarkKey
+        var defaultLangs: Set<String> = ["english"]
+        if let detected = Self.detectSystemLanguage() {
+            defaultLangs.insert(detected)
+        }
+        self.selectedLanguages = defaultLangs
         // a download into a folder that didn't finish: offer to continue there
         if let bm = UserDefaults.standard.data(forKey: "CyPortDownloadFolder") {
             var stale = false
@@ -69,9 +127,14 @@ final class StoreModel: ObservableObject {
         task = Task {
             do {
                 let say: (String) -> Void = { m in Task { @MainActor in self.phase = .preparing(m) } }
+                if s == .steam {
+                    self.hasPhantomLiberty = await SteamStore.shared.checkDLCOwned()
+                } else {
+                    self.hasPhantomLiberty = false
+                }
                 let p: DLPlan
                 switch s {
-                case .steam: p = try await SteamStore.shared.plan(progress: say)
+                case .steam: p = try await SteamStore.shared.plan(selectedLanguages: selectedLanguages, progress: say)
                 case .gog:
                     if gogBuilds.isEmpty { gogBuilds = try await GOGStore.shared.builds(); gogBuild = GOGStore.preferred(gogBuilds) }
                     guard let b = gogBuild else { throw StoreError("GOG lists no Mac version of the game.") }
@@ -220,9 +283,67 @@ struct StoreView: View {
                         ForEach(model.gogBuilds, id: \.id) { b in Text("\(b.version) (\(b.date))").tag(b.id) }
                     }.pickerStyle(.menu).tint(.yellow)
                 }
+
+                if s == .steam {
+                    HStack(spacing: 10) {
+                        Image(systemName: model.hasPhantomLiberty ? "checkmark.seal.fill" : "exclamationmark.triangle")
+                            .font(.system(size: 20))
+                            .foregroundColor(model.hasPhantomLiberty ? .yellow : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Phantom Liberty Expansion (DLC)")
+                                .font(.subheadline.bold())
+                                .foregroundColor(.white)
+                            Text(model.hasPhantomLiberty ? "Найдено на аккаунте Steam · Будет загружено" : "Не найдено на этом аккаунте Steam · Только базовая игра")
+                                .font(.caption)
+                                .foregroundColor(model.hasPhantomLiberty ? .green : .gray)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(8)
+                }
+
                 Text("Version: \(p.versionName) · \(p.files.count) files · \(gb(p.totalBytes))")
                     .foregroundColor(.white)
                 versionNote(s, p)
+
+                Divider().background(Color.gray)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Языковые пакеты (Language Packs)").font(.subheadline.bold()).foregroundColor(.white)
+                    ForEach(availableLanguages) { lang in
+                        Button {
+                            model.toggleLanguage(lang.id)
+                        } label: {
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: model.selectedLanguages.contains(lang.id) ? "checkmark.square.fill" : "square")
+                                    .foregroundColor(lang.isDefault ? .gray : (model.selectedLanguages.contains(lang.id) ? .yellow : .white))
+                                    .font(.system(size: 18))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Text(lang.name)
+                                            .font(.subheadline)
+                                            .foregroundColor(lang.isDefault ? .gray : .white)
+                                        if lang.isDefault {
+                                            Text("(Обязательно)")
+                                                .font(.caption2)
+                                                .foregroundColor(.gray)
+                                        }
+                                    }
+                                    Text(lang.detail)
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                        .multilineTextAlignment(.leading)
+                                }
+                                Spacer()
+                            }
+                        }
+                        .disabled(lang.isDefault)
+                        .buttonStyle(.plain)
+                    }
+                }
+
                 Divider().background(Color.gray)
                 Text("Save to").font(.subheadline.bold()).foregroundColor(.white)
                 HStack {

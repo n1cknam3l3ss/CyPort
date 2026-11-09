@@ -239,9 +239,15 @@ struct DLPlan {
 
 enum GameFiles {
     static let dataDirs = ["archive", "engine", "r6"]
+    static let langMap: [String: String] = [
+        "en": "english", "ru": "russian", "pl": "polish", "fr": "french",
+        "de": "german", "es": "spanish", "it": "italian", "ja": "japanese",
+        "zh": "schinese", "ko": "koreana", "pt": "brazilian"
+    ]
+
     /// Keep only the game's data folders (the Mac app bundle with the executable is skipped) and make their paths
     /// relative to the game folder, wherever the store puts it.
-    static func pick(_ files: [DLFile]) throws -> [DLFile] {
+    static func pick(_ files: [DLFile], selectedLanguages: Set<String> = ["english"]) throws -> [DLFile] {
         var prefix: String?
         for f in files {
             let l = f.path.lowercased()
@@ -258,6 +264,17 @@ enum GameFiles {
             let rel = String(f.path.dropFirst(pre.count))
             guard let top = rel.split(separator: "/").first, dataDirs.contains(top.lowercased()), rel.contains("/") else { continue }
             guard !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." }) else { continue }
+
+            let fn = (rel as NSString).lastPathComponent.lowercased()
+            if fn.hasPrefix("lang_") || fn.hasPrefix("ep1_lang_") {
+                let stripped = fn.replacingOccurrences(of: "ep1_lang_", with: "").replacingOccurrences(of: "lang_", with: "")
+                if let code = stripped.split(separator: "_").first.map(String.init), let lName = langMap[code] {
+                    if lName != "english" && !selectedLanguages.contains(lName) {
+                        continue
+                    }
+                }
+            }
+
             f.path = rel
             if byPath[rel.lowercased()] == nil { order.append(rel.lowercased()) }
             byPath[rel.lowercased()] = f                         // a later depot (DLC, language) wins
@@ -794,9 +811,24 @@ final class SteamStore: @unchecked Sendable {
         return out as Data
     }
 
-    struct Depot { let id: UInt32; let gid: UInt64; let name: String; let dlc: UInt32? }
+    struct Depot { let id: UInt32; let gid: UInt64; let name: String; let dlc: UInt32?; let language: String? }
 
-    /// the app's Mac depots (base game, owned DLC, English) from Steam's app info
+    /// Checks whether the account owns the Phantom Liberty expansion (2138330)
+    func checkDLCOwned(_ dlcApp: UInt32 = 2138330) async -> Bool {
+        do {
+            if !loggedOn { try await logOn() }
+            var kb = PBWriter(); kb.u(1, 2224089); kb.u(2, UInt64(dlcApp))
+            let kr = try PBMessage(try await cm.call(.clientGetDepotDecryptionKey, kb).body)
+            if (kr.i32(1) ?? 2) == 1 { return true }
+            var kb2 = PBWriter(); kb2.u(1, 2224089); kb2.u(2, UInt64(Game.steamApp))
+            let kr2 = try PBMessage(try await cm.call(.clientGetDepotDecryptionKey, kb2).body)
+            return (kr2.i32(1) ?? 2) == 1
+        } catch {
+            return false
+        }
+    }
+
+    /// the app's Mac depots from Steam's app info
     func macDepots(app: UInt32 = Game.steamApp) async throws -> (depots: [Depot], buildID: String) {
         if !loggedOn { try await logOn() }
         var tq = PBWriter(); tq.u(2, UInt64(app))
@@ -822,16 +854,16 @@ final class SteamStore: @unchecked Sendable {
             guard let id = UInt32(k) else { continue }
             let cfg = d["config"]
             let os = (cfg?["oslist"]?.string ?? "").lowercased()
-            let lang = (cfg?["language"]?.string ?? "").lowercased()
+            let lang = cfg?["language"]?.string?.lowercased()
             guard os.split(separator: ",").contains("macos") else { continue }
-            guard lang.isEmpty || lang == "english" else { continue }
             guard d["depotfromapp"] == nil else { continue }
             guard (cfg?["lowviolence"]?.string ?? "0") != "1" else { continue }
             let pub = d["manifests"]?["public"]
             guard let gs = pub?["gid"]?.string ?? pub?.string, let gid = UInt64(gs) else { continue }
-            out.append(Depot(id: id, gid: gid, name: d["name"]?.string ?? k, dlc: d["dlcappid"]?.string.flatMap { UInt32($0) }))
+            let dlcApp = d["dlcappid"]?.string.flatMap { UInt32($0) }
+            out.append(Depot(id: id, gid: gid, name: d["name"]?.string ?? k, dlc: dlcApp, language: lang))
         }
-        storeLog("steam: Mac depots \(out.map { "\($0.id)\($0.dlc != nil ? "(dlc)" : "")" }.joined(separator: ",")), build \(build)")
+        storeLog("steam: Mac depots \(out.map { "\($0.id)\($0.dlc != nil ? "(dlc)" : "")\($0.language.map { "(\($0))" } ?? "")" }.joined(separator: ",")), build \(build)")
         guard !out.isEmpty else { throw StoreError("Steam lists no Mac download for Cyberpunk 2077.") }
         return (out, build)
     }
@@ -857,29 +889,55 @@ final class SteamStore: @unchecked Sendable {
     }
 
     /// the whole download: every owned Mac depot's files, chunk by chunk
-    func plan(progress: @escaping (String) -> Void) async throws -> DLPlan {
+    func plan(selectedLanguages: Set<String> = ["english"], progress: @escaping (String) -> Void) async throws -> DLPlan {
         let (depots, build) = try await macDepots()
         let servers = try await servers()
         storeLog("steam: \(servers.count) download servers")
+
+        let hasDLC = await checkDLCOwned()
+        storeLog("steam: Phantom Liberty DLC owned = \(hasDLC)")
+
+        let filteredDepots = depots.filter { d in
+            if d.dlc != nil && !hasDLC { return false }
+            guard let lang = d.language, !lang.isEmpty else { return true }
+            if lang == "english" { return true }
+            return selectedLanguages.contains(lang)
+        }
+        storeLog("steam: selected depots: \(filteredDepots.map { "\($0.id)" }.joined(separator: ","))")
+
         struct ChunkRef { let depot: UInt32; let sha: Data; let crc: UInt32; let size: Int; let csize: Int }
         var chunks: [ChunkRef] = [], index: [Data: Int] = [:], files: [DLFile] = [], keys: [UInt32: Data] = [:]
         var ownedAny = false
-        for d in depots {
+        for d in filteredDepots {
             progress("Reading Steam depot \(d.id)…")
-            var kb = PBWriter(); kb.u(1, UInt64(d.id)); kb.u(2, UInt64(Game.steamApp))
-            let kr = try PBMessage(try await cm.call(.clientGetDepotDecryptionKey, kb).body)
+            let appForDepot = d.dlc ?? Game.steamApp
+            var kb = PBWriter(); kb.u(1, UInt64(d.id)); kb.u(2, UInt64(appForDepot))
+            var kr = try PBMessage(try await cm.call(.clientGetDepotDecryptionKey, kb).body)
+            if (kr.i32(1) ?? 2) != 1 && d.dlc != nil {
+                var kb2 = PBWriter(); kb2.u(1, UInt64(d.id)); kb2.u(2, UInt64(Game.steamApp))
+                if let kr2 = try? PBMessage(try await cm.call(.clientGetDepotDecryptionKey, kb2).body), (kr2.i32(1) ?? 2) == 1 {
+                    kr = kr2
+                }
+            }
             guard (kr.i32(1) ?? 2) == 1, let key = kr.data(3), key.count == 32 else {
                 storeLog("steam: depot \(d.id) not available to this account (result \(kr.i32(1) ?? 2))"); continue
             }
             keys[d.id] = key; if d.dlc == nil { ownedAny = true }
-            var cb = PBWriter(); cb.u(1, UInt64(Game.steamApp)); cb.u(2, UInt64(d.id)); cb.u(3, d.gid); cb.s(4, "public")
-            let code = try await cm.service("ContentServerDirectory.GetManifestRequestCode#1", cb, authed: true).u(1) ?? 0
+
+            var cb = PBWriter(); cb.u(1, UInt64(appForDepot)); cb.u(2, UInt64(d.id)); cb.u(3, d.gid); cb.s(4, "public")
+            var code = (try? await cm.service("ContentServerDirectory.GetManifestRequestCode#1", cb, authed: true).u(1)) ?? 0
+            if code == 0 && d.dlc != nil {
+                var cb2 = PBWriter(); cb2.u(1, UInt64(Game.steamApp)); cb2.u(2, UInt64(d.id)); cb2.u(3, d.gid); cb2.s(4, "public")
+                code = (try? await cm.service("ContentServerDirectory.GetManifestRequestCode#1", cb2, authed: true).u(1)) ?? 0
+            }
             var manifest: Data?
             var last: Error = StoreError("no server")
-            for s in servers.prefix(4) {
+            for s in servers.prefix(6) {
                 do {
                     let url = URL(string: "https://\(s.host)/depot/\(d.id)/manifest/\(d.gid)/5\(code != 0 ? "/\(code)" : "")")!
-                    manifest = try Zip.firstEntry(try await Net.request(url)); break
+                    let data = try await Net.request(url)
+                    manifest = (try? Zip.firstEntry(data)) ?? data
+                    if manifest != nil { break }
                 } catch { last = error }
             }
             guard let raw = manifest else { throw last }
@@ -897,7 +955,7 @@ final class SteamStore: @unchecked Sendable {
             }
         }
         guard ownedAny else { throw StoreError("This Steam account doesn't own Cyberpunk 2077 (Steam refused the download key).") }
-        let picked = try GameFiles.pick(files)
+        let picked = try GameFiles.pick(files, selectedLanguages: selectedLanguages)
         let refs = chunks, ks = keys, hosts = servers.map(\.host)
         let counter = Counter()
         return DLPlan(files: picked, chunkCount: refs.count, version: "steam-\(build)", versionName: "Steam build \(build)", fetch: { i in
