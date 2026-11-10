@@ -3470,26 +3470,24 @@ typedef enum {
     MSModeFoot = 0,     // Foot Combat & Exploration
     MSModeCar,          // Car Cruising
     MSModeCarArmed,     // Car Combat (shooting while driving)
-    MSModeScanner,      // Quickhacks & Scanning
-    MSModeCutscene      // Cutscenes & Dialogues
+    MSModeScanner       // Quickhacks & Scanning
 } MSControlMode;
 
 #define M_FOOT      (1 << MSModeFoot)
 #define M_CAR       (1 << MSModeCar)
 #define M_CAR_ARMED (1 << MSModeCarArmed)
 #define M_SCAN      (1 << MSModeScanner)
-#define M_CIN       (1 << MSModeCutscene)
-#define M_ALL       (M_FOOT | M_CAR | M_CAR_ARMED | M_SCAN | M_CIN)
+#define M_ALL       (M_FOOT | M_CAR | M_CAR_ARMED | M_SCAN)
 #define M_VEHICLE   (M_CAR | M_CAR_ARMED)
 
 typedef enum {
     MSCtlButton = 0,
     MSCtlToggleHUD,
     MSCtlCombo,             // e.g. LB + RB for Cyberware Ability
-    MSCtlModeSelect,        // switches mode to targetMode
+    MSCtlCarToggle,         // enter car & switch to Car Mode
     MSCtlScannerToggle,     // toggles scanner on/off
     MSCtlCarWeaponToggle,   // toggles weapon in car
-    MSCtlHoldAction         // holds button for 0.8s (e.g. exit car / skip cutscene)
+    MSCtlHoldAction         // holds button for 0.8s (e.g. exit car)
 } MSCtlKind;
 
 #define CP_YELLOW  [UIColor colorWithRed:0.98 green:0.85 blue:0.15 alpha:1.0]
@@ -3550,6 +3548,7 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     CGSize _laidOut;
     MSControlMode _currentMode;
     BOOL _sprinting;
+    BOOL _inMenu;
     
     // Left dynamic stick
     UITouch *_moveTouch;
@@ -3597,17 +3596,13 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     id ls = MSConfig()[@"LookSpeed"]; _lookSpeed = ls ? [ls floatValue] : 1; if (_lookSpeed <= 0) _lookSpeed = 1;
     _currentMode = MSModeFoot;
     _ctls = [NSMutableArray array];
+    _inMenu = YES;
     
     GCExtendedGamepad *g = g_pad;
     
-    // Top Bar (M_ALL)
+    // Top Bar (Always available)
     [self addKind:MSCtlButton mask:M_ALL label:@"MAP" sym:@"square.grid.2x2.fill" color:CP_CYAN r:18 b1:g.buttonOptions b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_ALL label:@"ESC" sym:@"pause.fill" color:CP_WHITE r:18 b1:g.buttonMenu b2:nil dx:0 dy:0 key:(NSInteger)GCKeyCodeEscape target:0 pill:NO size:CGSizeZero];
-    
-    // Mode Pills at Top Center
-    [self addKind:MSCtlModeSelect mask:M_ALL label:@"FOOT" sym:@"figure.walk" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeFoot pill:YES size:CGSizeMake(46, 24)];
-    [self addKind:MSCtlModeSelect mask:M_ALL label:@"CAR" sym:@"car.fill" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeCar pill:YES size:CGSizeMake(46, 24)];
-    [self addKind:MSCtlModeSelect mask:M_ALL label:@"CIN" sym:@"bubble.left.and.bubble.right.fill" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeCutscene pill:YES size:CGSizeMake(46, 24)];
     [self addKind:MSCtlToggleHUD mask:M_ALL label:@"🎮" sym:nil color:CP_WHITE r:14 b1:nil b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     
     // Foot Mode Combat (M_FOOT)
@@ -3622,17 +3617,17 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     [self addKind:MSCtlButton mask:M_FOOT label:@"RB" sym:@"flame.fill" color:CP_ORANGE r:22 b1:g.rightShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_FOOT label:@"R3" sym:@"hand.raised.fill" color:CP_GRAY r:20 b1:g.rightThumbstickButton b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     
-    // Foot Mode D-Pad
+    // Foot Mode D-Pad: Car button enters car & switches to Car Mode
     [self addKind:MSCtlButton mask:M_FOOT label:@"HEAL" sym:@"cross.case.fill" color:CP_GREEN r:23 b1:nil b2:nil dx:0 dy:1 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_FOOT label:@"PHONE" sym:@"phone.fill" color:CP_BLUE r:19 b1:nil b2:nil dx:0 dy:-1 key:0 target:0 pill:NO size:CGSizeZero];
-    [self addKind:MSCtlButton mask:M_FOOT label:@"CALL" sym:@"car.fill" color:CP_YELLOW r:20 b1:nil b2:nil dx:1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlCarToggle mask:M_FOOT label:@"CAR" sym:@"car.fill" color:CP_YELLOW r:22 b1:g.buttonX b2:nil dx:1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_FOOT label:@"RADIO" sym:@"radio.fill" color:CP_PURPLE r:19 b1:nil b2:nil dx:-1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     
     // Car Mode Cruising (M_CAR)
     [self addKind:MSCtlButton mask:M_CAR label:@"GAS" sym:@"speedometer" color:CP_GREEN r:36 b1:g.rightTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_CAR label:@"BRAKE" sym:@"arrow.down" color:CP_RED r:36 b1:g.leftTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_CAR label:@"P" sym:@"exclamationmark.circle.fill" color:CP_YELLOW r:26 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
-    [self addKind:MSCtlHoldAction mask:M_CAR label:@"EXIT" sym:@"door.left.hand.open" color:CP_RED r:24 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlHoldAction mask:M_CAR label:@"EXIT" sym:@"door.left.hand.open" color:CP_RED r:26 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlCarWeaponToggle mask:M_CAR label:@"GUN" sym:@"triangle.fill" color:CP_YELLOW r:24 b1:g.buttonY b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_CAR label:@"CAM" sym:@"camera.fill" color:CP_WHITE r:20 b1:nil b2:nil dx:1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_CAR label:@"CAR_RADIO" sym:@"radio.fill" color:CP_PURPLE r:20 b1:nil b2:nil dx:-1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
@@ -3656,12 +3651,6 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_EXEC" sym:@"paperplane.fill" color:CP_CYAN r:32 b1:g.buttonX b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_TAG" sym:@"tag.fill" color:CP_YELLOW r:26 b1:g.rightThumbstickButton b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
     [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_TAB" sym:@"arrow.left.arrow.right" color:CP_WHITE r:24 b1:g.rightShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
-    
-    // Cutscene Mode (M_CIN)
-    [self addKind:MSCtlHoldAction mask:M_CIN label:@"CIN_SKIP" sym:@"forward.end.fill" color:CP_YELLOW r:32 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
-    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_OK" sym:@"checkmark.circle.fill" color:CP_GREEN r:28 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
-    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_UP" sym:@"chevron.up" color:CP_WHITE r:28 b1:nil b2:nil dx:0 dy:1 key:0 target:0 pill:NO size:CGSizeZero];
-    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_DOWN" sym:@"chevron.down" color:CP_WHITE r:28 b1:nil b2:nil dx:0 dy:-1 key:0 target:0 pill:NO size:CGSizeZero];
     
     for (MSCtl *c in _ctls) {
         c.shape = [CAShapeLayer layer];
@@ -3719,10 +3708,7 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         // Top Bar
         @"MAP": @[ @(L + 25), @(T + 20) ],
         @"ESC": @[ @(R - 25), @(T + 20) ],
-        @"FOOT": @[ @(S.width / 2 - 55), @(T + 20) ],
-        @"CAR": @[ @(S.width / 2), @(T + 20) ],
-        @"CIN": @[ @(S.width / 2 + 55), @(T + 20) ],
-        @"🎮": @[ @(S.width / 2 + 105), @(T + 20) ],
+        @"🎮": @[ @(S.width / 2), @(T + 20) ],
         
         // Foot Mode
         @"FIRE": @[ @(R - 48), @(H - 105) ],
@@ -3738,7 +3724,7 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         
         @"HEAL": @[ @(L + 95), @(H - 165) ],
         @"PHONE": @[ @(L + 95), @(H - 22) ],
-        @"CALL": @[ @(L + 165), @(H - 95) ],
+        @"CAR": @[ @(L + 165), @(H - 95) ],
         @"RADIO": @[ @(L + 25), @(H - 95) ],
         
         // Car Mode Cruising
@@ -3769,12 +3755,6 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         @"SCAN_EXEC": @[ @(R - 55), @(H - 90) ],
         @"SCAN_TAG": @[ @(R - 130), @(H - 140) ],
         @"SCAN_TAB": @[ @(R - 130), @(H - 65) ],
-        
-        // Cutscene Mode
-        @"CIN_SKIP": @[ @(R - 55), @(H - 85) ],
-        @"CIN_OK": @[ @(R - 130), @(H - 85) ],
-        @"CIN_UP": @[ @(L + 65), @(H - 135) ],
-        @"CIN_DOWN": @[ @(L + 65), @(H - 65) ],
     };
     
     _lHome = CGPointMake(L + 95, H - 95);
@@ -3785,20 +3765,14 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         if (coord) {
             c.center = CGPointMake([coord[0] doubleValue], [coord[1] doubleValue]);
         }
-        if (c.isPill) {
-            c.shape.path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(c.center.x - c.pillSize.width/2, c.center.y - c.pillSize.height/2, c.pillSize.width, c.pillSize.height) cornerRadius:c.pillSize.height/2].CGPath;
-            c.text.frame = CGRectMake(c.center.x - c.pillSize.width/2, c.center.y - 7, c.pillSize.width, 14);
-            c.text.string = c.label;
-        } else {
-            c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
-            if (c.icon) {
-                c.icon.frame = CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r);
-            }
-            CGFloat fs = c.r > 24 ? 12 : 10;
-            c.text.fontSize = fs;
-            c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.6, 2 * c.r, fs * 1.3);
-            if (!c.icon) c.text.string = c.label;
+        c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
+        if (c.icon) {
+            c.icon.frame = CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r);
         }
+        CGFloat fs = c.r > 24 ? 12 : 10;
+        c.text.fontSize = fs;
+        c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.6, 2 * c.r, fs * 1.3);
+        if (!c.icon) c.text.string = c.label;
         [self msPaint:c];
     }
     
@@ -3807,7 +3781,8 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
 }
 
 - (void)msDrawStick:(CAShapeLayer *)b knob:(CAShapeLayer *)k at:(CGPoint)p offset:(CGPoint)o r:(CGFloat)r {
-    BOOL showStick = !_hiddenByUser && (_currentMode != MSModeScanner && _currentMode != MSModeCutscene);
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
+    BOOL showStick = !_hiddenByUser && inGameplay && (_currentMode != MSModeScanner);
     b.hidden = k.hidden = !showStick;
     if (!showStick) return;
     b.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)].CGPath;
@@ -3817,8 +3792,16 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
 
 - (void)msPaint:(MSCtl *)c {
     BOOL on = c.touch != nil;
-    BOOL isModePillActive = (c.kind == MSCtlModeSelect && c.targetMode == _currentMode);
-    BOOL visible = !_hiddenByUser && ((c.modeMask & (1 << _currentMode)) != 0);
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
+    BOOL inMenu = !inGameplay;
+    
+    // In menu: only keep ESC (pause/back) and HUD toggle. All other gameplay controls hide!
+    BOOL visible;
+    if (inMenu) {
+        visible = !_hiddenByUser && (c.kind == MSCtlToggleHUD || c.key == (NSInteger)GCKeyCodeEscape);
+    } else {
+        visible = !_hiddenByUser && ((c.modeMask & (1 << _currentMode)) != 0);
+    }
     
     c.shape.hidden = !visible;
     if (c.icon) c.icon.hidden = !visible;
@@ -3826,15 +3809,9 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     if (!visible) return;
     
     UIColor *baseCol = c.accentColor ?: UIColor.whiteColor;
-    if (isModePillActive) {
-        c.shape.strokeColor = CP_YELLOW.CGColor;
-        c.shape.fillColor = [CP_YELLOW colorWithAlphaComponent:0.5].CGColor;
-        c.shape.lineWidth = 2.0;
-    } else {
-        c.shape.strokeColor = [baseCol colorWithAlphaComponent:on ? 0.95 : 0.45].CGColor;
-        c.shape.fillColor = [baseCol colorWithAlphaComponent:on ? 0.55 : 0.15].CGColor;
-        c.shape.lineWidth = on ? 2.0 : 1.5;
-    }
+    c.shape.strokeColor = [baseCol colorWithAlphaComponent:on ? 0.95 : 0.45].CGColor;
+    c.shape.fillColor = [baseCol colorWithAlphaComponent:on ? 0.55 : 0.15].CGColor;
+    c.shape.lineWidth = on ? 2.0 : 1.5;
     
     if (c.kind == MSCtlToggleHUD) {
         c.shape.opacity = c.text.opacity = _hiddenByUser ? 0.4 : 1.0;
@@ -3849,22 +3826,32 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         }
         return nil;
     }
-    int curBit = (1 << _currentMode);
-    for (MSCtl *c in _ctls) {
-        if ((c.modeMask & curBit) == 0) continue;
-        if (c.isPill) {
-            CGFloat halfW = c.pillSize.width / 2.0 + 6, halfH = c.pillSize.height / 2.0 + 6;
-            if (fabs(p.x - c.center.x) <= halfW && fabs(p.y - c.center.y) <= halfH) return c;
-        } else {
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
+    if (!inGameplay) {
+        for (MSCtl *c in _ctls) if (c.kind == MSCtlToggleHUD || c.key == (NSInteger)GCKeyCodeEscape) {
             CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
             if (dx * dx + dy * dy <= r * r) return c;
         }
+        return nil;
+    }
+    int curBit = (1 << _currentMode);
+    for (MSCtl *c in _ctls) {
+        if ((c.modeMask & curBit) == 0) continue;
+        CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
+        if (dx * dx + dy * dy <= r * r) return c;
     }
     return nil;
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     if (self.hidden) return nil;
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
+    if (!inGameplay) {
+        // In menu: let touches fall through to MSHostView as direct touch-as-mouse clicks!
+        MSCtl *c = [self msCtlAt:p];
+        if (c && (c.kind == MSCtlToggleHUD || c.key == (NSInteger)GCKeyCodeEscape)) return self;
+        return nil;
+    }
     if ([self msCtlAt:p]) return self;
     if (_hiddenByUser) return nil;
     return self;
@@ -3883,8 +3870,15 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
         [self msUpdateLayout];
         return;
     }
-    if (c.kind == MSCtlModeSelect) {
-        _currentMode = c.targetMode;
+    if (c.kind == MSCtlCarToggle) {
+        if (_currentMode == MSModeFoot) {
+            _currentMode = MSModeCar;
+            // Tap X to enter vehicle
+            MSPadSetButton(g_pad.buttonX, 1);
+            MSAfter(0.12, ^{ MSPadSetButton(g_pad.buttonX, 0); });
+        } else {
+            _currentMode = MSModeFoot;
+        }
         [self msUpdateLayout];
         return;
     }
@@ -3951,6 +3945,7 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self];
         MSCtl *c = [self msCtlAt:p];
@@ -3959,9 +3954,11 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
             continue;
         }
         
+        if (!inGameplay) continue;
+        
         // Left side touch: Dynamic Stick
         if (p.x < self.bounds.size.width * 0.45) {
-            if (_currentMode == MSModeScanner || _currentMode == MSModeCutscene) continue;
+            if (_currentMode == MSModeScanner) continue;
             if (_moveTouch) continue;
             _moveTouch = t;
             _moveOrigin = p;
@@ -4003,7 +4000,7 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
             for (MSCtl *c in [_ctls copy]) {
                 if (c.touch == t && c.kind != MSCtlToggleHUD) {
                     CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y;
-                    CGFloat maxDist = (c.isPill ? c.pillSize.width : c.r) + 24;
+                    CGFloat maxDist = c.r + 24;
                     if (dx * dx + dy * dy > maxDist * maxDist) [self msRelease:c];
                 }
             }
@@ -4072,11 +4069,12 @@ static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
     if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); }
     if (!want) return;
     [self msLayout];
-    float op = (g_pointerLocked || g_cursorHidden || _moveTouch) ? 1.0 : 0.4;
-    if (_stickBase.opacity != op) {
-        [CATransaction begin]; [CATransaction setDisableActions:YES];
-        _stickBase.opacity = _stickKnob.opacity = op;
-        [CATransaction commit];
+    
+    BOOL inGameplay = (g_pointerLocked || g_cursorHidden);
+    BOOL inMenu = !inGameplay;
+    if (inMenu != _inMenu) {
+        _inMenu = inMenu;
+        [self msUpdateLayout];
     }
 }
 @end
