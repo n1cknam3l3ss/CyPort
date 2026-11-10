@@ -568,7 +568,10 @@ static void MSLeftPress(int by, BOOL down) {
     if (t != g_fTouch) return;
     if (ph == 1) {
         CGFloat dx = p.x - g_fLast.x, dy = p.y - g_fLast.y;
-        if (g_fMode == 0 && hypot(p.x - g_fStart.x, p.y - g_fStart.y) > 8) g_fMode = 1;
+        if (g_fMode == 0 && hypot(p.x - g_fStart.x, p.y - g_fStart.y) > 8) {
+            g_fMode = (g_fFingers >= 2) ? 1 : 2;
+            if (g_fMode == 2) [self msButton:YES right:NO at:g_fStart];
+        }
         if (g_fMode == 1) [self msScrollBy:CGPointMake(dx, dy) at:g_fStart];
         else if (g_fMode == 2) MSDispatch([self msEvent:MSLDrag at:p]);
         g_fLast = p; return;
@@ -3459,224 +3462,622 @@ static BOOL MSRealControllerConnected(void) {
     for (GCController *c in all) if (!c.isSnapshot) return YES;
     return NO;
 }
-typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
+/* =========================================================================================
+ * Touch HUD 2.0: Contextual On-Screen Controls for Cyberpunk 2077
+ * ========================================================================================= */
+
+typedef enum {
+    MSModeFoot = 0,     // Foot Combat & Exploration
+    MSModeCar,          // Car Cruising
+    MSModeCarArmed,     // Car Combat (shooting while driving)
+    MSModeScanner,      // Quickhacks & Scanning
+    MSModeCutscene      // Cutscenes & Dialogues
+} MSControlMode;
+
+#define M_FOOT      (1 << MSModeFoot)
+#define M_CAR       (1 << MSModeCar)
+#define M_CAR_ARMED (1 << MSModeCarArmed)
+#define M_SCAN      (1 << MSModeScanner)
+#define M_CIN       (1 << MSModeCutscene)
+#define M_ALL       (M_FOOT | M_CAR | M_CAR_ARMED | M_SCAN | M_CIN)
+#define M_VEHICLE   (M_CAR | M_CAR_ARMED)
+
+typedef enum {
+    MSCtlButton = 0,
+    MSCtlToggleHUD,
+    MSCtlCombo,             // e.g. LB + RB for Cyberware Ability
+    MSCtlModeSelect,        // switches mode to targetMode
+    MSCtlScannerToggle,     // toggles scanner on/off
+    MSCtlCarWeaponToggle,   // toggles weapon in car
+    MSCtlHoldAction         // holds button for 0.8s (e.g. exit car / skip cutscene)
+} MSCtlKind;
+
+#define CP_YELLOW  [UIColor colorWithRed:0.98 green:0.85 blue:0.15 alpha:1.0]
+#define CP_CYAN    [UIColor colorWithRed:0.0 green:0.88 blue:0.95 alpha:1.0]
+#define CP_RED     [UIColor colorWithRed:0.95 green:0.25 blue:0.25 alpha:1.0]
+#define CP_GREEN   [UIColor colorWithRed:0.18 green:0.85 blue:0.45 alpha:1.0]
+#define CP_ORANGE  [UIColor colorWithRed:0.98 green:0.55 blue:0.15 alpha:1.0]
+#define CP_BLUE    [UIColor colorWithRed:0.25 green:0.6 blue:0.98 alpha:1.0]
+#define CP_PURPLE  [UIColor colorWithRed:0.75 green:0.4 blue:0.95 alpha:1.0]
+#define CP_WHITE   [UIColor colorWithWhite:0.95 alpha:1.0]
+#define CP_GRAY    [UIColor colorWithWhite:0.65 alpha:1.0]
+
+static UIImage *MSMakeSymbol(NSString *name, CGFloat ptSize, UIColor *tint) {
+    if (!name.length) return nil;
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:ptSize weight:UIImageSymbolWeightBold];
+    UIImage *sym = [UIImage systemImageNamed:name withConfiguration:cfg];
+    if (!sym) return nil;
+    if (tint) sym = [sym imageWithTintColor:tint renderingMode:UIImageRenderingModeAlwaysOriginal];
+    
+    // Render into a clean bitmap context so CGImage is fully valid and tinted for CALayer
+    CGSize sz = sym.size;
+    if (sz.width <= 0 || sz.height <= 0) return sym;
+    UIGraphicsBeginImageContextWithOptions(sz, NO, UIScreen.mainScreen.scale);
+    [sym drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+    UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return rendered ?: sym;
+}
+
 @interface MSCtl : NSObject
-@property MSCtlKind kind; @property CGPoint center; @property CGFloat r; @property(copy) NSString *label;
-@property(weak) GCControllerButtonInput *button; @property int dpadX, dpadY; @property NSInteger key; @property(strong) CAShapeLayer *shape; @property(strong) CATextLayer *text;
+@property MSCtlKind kind;
+@property MSControlMode targetMode;
+@property int modeMask;
+@property CGPoint center;
+@property CGFloat r;
+@property(copy) NSString *label;
+@property(copy) NSString *sfSymbol;
+@property(strong) UIColor *accentColor;
+@property(weak) GCControllerButtonInput *button;
+@property(weak) GCControllerButtonInput *button2;
+@property int dpadX, dpadY;
+@property NSInteger key;
+@property(strong) CAShapeLayer *shape;
+@property(strong) CATextLayer *text;
+@property(strong) CALayer *icon;
 @property(weak) UITouch *touch;
+@property BOOL isPill;
+@property CGSize pillSize;
+@property BOOL isHoldTriggered;
 @end
 @implementation MSCtl @end
 
 @interface MSPadView : UIView @end
 @implementation MSPadView {
-    NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut;
-    UITouch *_moveTouch, *_lookTouch; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
-    CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
-    CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
-    double _stickT0; CGPoint _stickP0; CGFloat _stickMax; int _lookMouse;
+    NSMutableArray<MSCtl *> *_ctls;
+    BOOL _hiddenByUser, _shown;
+    CADisplayLink *_link;
+    CGSize _laidOut;
+    MSControlMode _currentMode;
+    BOOL _sprinting;
+    
+    // Left dynamic stick
+    UITouch *_moveTouch;
+    CGPoint _moveOrigin, _lHome;
+    CAShapeLayer *_stickBase, *_stickKnob;
+    double _stickT0;
+    CGPoint _stickP0;
+    CGFloat _stickMax;
+    
+    // Right stick / camera look
+    UITouch *_lookTouch;
+    CGPoint _lookLast;
+    double _lookT, _lookMoved;
+    float _lookSpeed;
+    
+    int _wasd;
 }
+
+- (MSCtl *)addKind:(MSCtlKind)k mask:(int)mask label:(NSString *)lbl sym:(NSString *)sym color:(UIColor *)col r:(CGFloat)r
+                b1:(GCControllerButtonInput *)b1 b2:(GCControllerButtonInput *)b2 dx:(int)dx dy:(int)dy key:(NSInteger)key
+            target:(MSControlMode)target pill:(BOOL)pill size:(CGSize)size {
+    MSCtl *c = [MSCtl new];
+    c.kind = k;
+    c.modeMask = mask;
+    c.label = lbl;
+    c.sfSymbol = sym;
+    c.accentColor = col ?: CP_WHITE;
+    c.r = r;
+    c.button = b1;
+    c.button2 = b2;
+    c.dpadX = dx;
+    c.dpadY = dy;
+    c.key = key;
+    c.targetMode = target;
+    c.isPill = pill;
+    c.pillSize = size;
+    [_ctls addObject:c];
+    return c;
+}
+
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
     self.multipleTouchEnabled = YES; self.backgroundColor = UIColor.clearColor;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     id ls = MSConfig()[@"LookSpeed"]; _lookSpeed = ls ? [ls floatValue] : 1; if (_lookSpeed <= 0) _lookSpeed = 1;
+    _currentMode = MSModeFoot;
     _ctls = [NSMutableArray array];
+    
     GCExtendedGamepad *g = g_pad;
-    struct { __unsafe_unretained NSString *l; __unsafe_unretained GCControllerButtonInput *b; int dx, dy; NSInteger key; } d[] = {
-        { @"A", g.buttonA }, { @"B", g.buttonB }, { @"X", g.buttonX }, { @"Y", g.buttonY },
-        { @"LB", g.leftShoulder }, { @"LT", g.leftTrigger }, { @"RB", g.rightShoulder }, { @"RT", g.rightTrigger },
-        { @"L3", g.leftThumbstickButton }, { @"R3", g.rightThumbstickButton },
-        { @"▲", nil, 0, 1, g ? 0 : (NSInteger)GCKeyCodeUpArrow }, { @"▼", nil, 0, -1, g ? 0 : (NSInteger)GCKeyCodeDownArrow },
-        { @"◀", nil, -1, 0, g ? 0 : (NSInteger)GCKeyCodeLeftArrow }, { @"▶", nil, 1, 0, g ? 0 : (NSInteger)GCKeyCodeRightArrow },
-        { @"⧉", g.buttonOptions }, { @"≡", g.buttonMenu },
-        { @"Esc", nil, 0, 0, (NSInteger)GCKeyCodeEscape }, { @"Space", nil, 0, 0, (NSInteger)GCKeyCodeSpacebar }, { @"Enter", nil, 0, 0, (NSInteger)GCKeyCodeReturnOrEnter },
-    };
-    for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
-        if (!d[i].b && !d[i].dx && !d[i].dy && !d[i].key) continue;      /* no virtual controller: keyboard keys only */
-        MSCtl *c = [MSCtl new]; c.kind = MSCtlButton; c.label = d[i].l; c.button = d[i].b; c.dpadX = d[i].dx; c.dpadY = d[i].dy; c.key = d[i].key; [_ctls addObject:c];
-    }
-    MSCtl *t = [MSCtl new]; t.kind = MSCtlToggle; t.label = @"🎮"; [_ctls addObject:t];
+    
+    // Top Bar (M_ALL)
+    [self addKind:MSCtlButton mask:M_ALL label:@"MAP" sym:@"square.grid.2x2.fill" color:CP_CYAN r:18 b1:g.buttonOptions b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_ALL label:@"ESC" sym:@"pause.fill" color:CP_WHITE r:18 b1:g.buttonMenu b2:nil dx:0 dy:0 key:(NSInteger)GCKeyCodeEscape target:0 pill:NO size:CGSizeZero];
+    
+    // Mode Pills at Top Center
+    [self addKind:MSCtlModeSelect mask:M_ALL label:@"FOOT" sym:@"figure.walk" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeFoot pill:YES size:CGSizeMake(46, 24)];
+    [self addKind:MSCtlModeSelect mask:M_ALL label:@"CAR" sym:@"car.fill" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeCar pill:YES size:CGSizeMake(46, 24)];
+    [self addKind:MSCtlModeSelect mask:M_ALL label:@"CIN" sym:@"bubble.left.and.bubble.right.fill" color:CP_WHITE r:0 b1:nil b2:nil dx:0 dy:0 key:0 target:MSModeCutscene pill:YES size:CGSizeMake(46, 24)];
+    [self addKind:MSCtlToggleHUD mask:M_ALL label:@"🎮" sym:nil color:CP_WHITE r:14 b1:nil b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Foot Mode Combat (M_FOOT)
+    [self addKind:MSCtlButton mask:M_FOOT label:@"FIRE" sym:@"scope" color:CP_RED r:34 b1:g.rightTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"AIM" sym:@"plus.magnifyingglass" color:CP_CYAN r:28 b1:g.leftTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlCombo mask:M_FOOT label:@"OS" sym:@"bolt.badge.clock.fill" color:CP_YELLOW r:26 b1:g.leftShoulder b2:g.rightShoulder dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlScannerToggle mask:M_FOOT label:@"SCAN" sym:@"eye.fill" color:CP_CYAN r:24 b1:g.leftShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"X" sym:@"arrow.clockwise" color:CP_WHITE r:22 b1:g.buttonX b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"A" sym:@"arrow.up.circle.fill" color:CP_GREEN r:26 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"B" sym:@"figure.walk" color:CP_RED r:22 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"Y" sym:@"triangle.fill" color:CP_YELLOW r:20 b1:g.buttonY b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"RB" sym:@"flame.fill" color:CP_ORANGE r:22 b1:g.rightShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"R3" sym:@"hand.raised.fill" color:CP_GRAY r:20 b1:g.rightThumbstickButton b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Foot Mode D-Pad
+    [self addKind:MSCtlButton mask:M_FOOT label:@"HEAL" sym:@"cross.case.fill" color:CP_GREEN r:23 b1:nil b2:nil dx:0 dy:1 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"PHONE" sym:@"phone.fill" color:CP_BLUE r:19 b1:nil b2:nil dx:0 dy:-1 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"CALL" sym:@"car.fill" color:CP_YELLOW r:20 b1:nil b2:nil dx:1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_FOOT label:@"RADIO" sym:@"radio.fill" color:CP_PURPLE r:19 b1:nil b2:nil dx:-1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Car Mode Cruising (M_CAR)
+    [self addKind:MSCtlButton mask:M_CAR label:@"GAS" sym:@"speedometer" color:CP_GREEN r:36 b1:g.rightTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR label:@"BRAKE" sym:@"arrow.down" color:CP_RED r:36 b1:g.leftTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR label:@"P" sym:@"exclamationmark.circle.fill" color:CP_YELLOW r:26 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlHoldAction mask:M_CAR label:@"EXIT" sym:@"door.left.hand.open" color:CP_RED r:24 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlCarWeaponToggle mask:M_CAR label:@"GUN" sym:@"triangle.fill" color:CP_YELLOW r:24 b1:g.buttonY b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR label:@"CAM" sym:@"camera.fill" color:CP_WHITE r:20 b1:nil b2:nil dx:1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR label:@"CAR_RADIO" sym:@"radio.fill" color:CP_PURPLE r:20 b1:nil b2:nil dx:-1 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR label:@"HORN" sym:@"speaker.wave.2.fill" color:CP_GRAY r:19 b1:g.leftThumbstickButton b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Car Armed Mode (M_CAR_ARMED)
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_FIRE" sym:@"scope" color:CP_RED r:34 b1:g.rightTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_AIM" sym:@"plus.magnifyingglass" color:CP_CYAN r:28 b1:g.leftTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_LOCK" sym:@"viewfinder" color:CP_CYAN r:24 b1:g.leftShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_X" sym:@"arrow.clockwise" color:CP_WHITE r:22 b1:g.buttonX b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlCarWeaponToggle mask:M_CAR_ARMED label:@"HOLSTER" sym:@"triangle.fill" color:CP_YELLOW r:22 b1:g.buttonY b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_GAS_L" sym:@"speedometer" color:CP_GREEN r:34 b1:g.rightTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_BRAKE_L" sym:@"arrow.down" color:CP_RED r:30 b1:g.leftTrigger b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CAR_ARMED label:@"CAR_P_L" sym:@"exclamationmark.circle.fill" color:CP_YELLOW r:24 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlHoldAction mask:M_CAR_ARMED label:@"CAR_EXIT_L" sym:@"door.left.hand.open" color:CP_RED r:24 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Scanner Mode (M_SCAN)
+    [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_UP" sym:@"chevron.up" color:CP_CYAN r:28 b1:nil b2:nil dx:0 dy:1 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_DOWN" sym:@"chevron.down" color:CP_CYAN r:28 b1:nil b2:nil dx:0 dy:-1 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlScannerToggle mask:M_SCAN label:@"SCAN_EXIT" sym:@"xmark.circle.fill" color:CP_RED r:24 b1:g.leftShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_EXEC" sym:@"paperplane.fill" color:CP_CYAN r:32 b1:g.buttonX b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_TAG" sym:@"tag.fill" color:CP_YELLOW r:26 b1:g.rightThumbstickButton b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_SCAN label:@"SCAN_TAB" sym:@"arrow.left.arrow.right" color:CP_WHITE r:24 b1:g.rightShoulder b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    
+    // Cutscene Mode (M_CIN)
+    [self addKind:MSCtlHoldAction mask:M_CIN label:@"CIN_SKIP" sym:@"forward.end.fill" color:CP_YELLOW r:32 b1:g.buttonB b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_OK" sym:@"checkmark.circle.fill" color:CP_GREEN r:28 b1:g.buttonA b2:nil dx:0 dy:0 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_UP" sym:@"chevron.up" color:CP_WHITE r:28 b1:nil b2:nil dx:0 dy:1 key:0 target:0 pill:NO size:CGSizeZero];
+    [self addKind:MSCtlButton mask:M_CIN label:@"CIN_DOWN" sym:@"chevron.down" color:CP_WHITE r:28 b1:nil b2:nil dx:0 dy:-1 key:0 target:0 pill:NO size:CGSizeZero];
+    
     for (MSCtl *c in _ctls) {
-        c.shape = [CAShapeLayer layer]; c.shape.lineWidth = 1.5; [self.layer addSublayer:c.shape];
-        c.text = [CATextLayer layer]; c.text.contentsScale = UIScreen.mainScreen.scale; c.text.alignmentMode = kCAAlignmentCenter;
-        c.text.foregroundColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor; c.text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:14 weight:UIFontWeightBold];
+        c.shape = [CAShapeLayer layer];
+        c.shape.lineWidth = 1.5;
+        [self.layer addSublayer:c.shape];
+        
+        if (c.sfSymbol.length) {
+            UIImage *img = MSMakeSymbol(c.sfSymbol, c.r > 25 ? 20 : 16, c.accentColor);
+            if (img) {
+                c.icon = [CALayer layer];
+                c.icon.contents = (__bridge id)img.CGImage;
+                c.icon.contentsGravity = kCAGravityCenter;
+                c.icon.contentsScale = UIScreen.mainScreen.scale;
+                [self.layer addSublayer:c.icon];
+            }
+        }
+        
+        c.text = [CATextLayer layer];
+        c.text.contentsScale = UIScreen.mainScreen.scale;
+        c.text.alignmentMode = kCAAlignmentCenter;
+        c.text.foregroundColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor;
+        c.text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:c.isPill ? 10 : 12 weight:UIFontWeightBold];
         [self.layer addSublayer:c.text];
     }
-    _stickBase = [CAShapeLayer layer]; _stickKnob = [CAShapeLayer layer];
-    _rBase = [CAShapeLayer layer]; _rKnob = [CAShapeLayer layer];
-    for (CAShapeLayer *l in @[ _stickBase, _stickKnob, _rBase, _rKnob ]) [self.layer addSublayer:l];
-    for (CAShapeLayer *l in @[ _stickBase, _rBase ]) { l.fillColor = [UIColor colorWithWhite:1 alpha:0.08].CGColor; l.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor; l.lineWidth = 2; }
-    for (CAShapeLayer *l in @[ _stickKnob, _rKnob ]) l.fillColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
-    if (!g_pad) { [_rBase removeFromSuperlayer]; [_rKnob removeFromSuperlayer]; _rHome = CGPointMake(-1000, -1000); }
+    
+    _stickBase = [CAShapeLayer layer];
+    _stickKnob = [CAShapeLayer layer];
+    for (CAShapeLayer *l in @[ _stickBase, _stickKnob ]) [self.layer addSublayer:l];
+    _stickBase.fillColor = [UIColor colorWithWhite:1 alpha:0.08].CGColor;
+    _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+    _stickBase.lineWidth = 2;
+    _stickKnob.fillColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+    
     _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(msTick:)];
-    _link.preferredFrameRateRange = CAFrameRateRangeMake(15, 30, 30);   /* runs on the game's thread: 30 Hz is plenty for the pad */
+    _link.preferredFrameRateRange = CAFrameRateRangeMake(15, 30, 30);
     [_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     self.hidden = YES;
     return self;
 }
+
 - (void)msLayout {
-    CGSize S = self.bounds.size; if (CGSizeEqualToSize(S, _laidOut)) return; _laidOut = S;
-    UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
-    NSDictionary *pos = @{
-        @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
-        @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
-        @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
-        @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
-        @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
-        @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
-        @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
+    CGSize S = self.bounds.size;
+    if (CGSizeEqualToSize(S, _laidOut)) return;
+    _laidOut = S;
+    [self msUpdateLayout];
+}
+
+- (void)msUpdateLayout {
+    CGSize S = self.bounds.size;
+    if (S.width < 100 || S.height < 100) return;
+    UIEdgeInsets in = self.safeAreaInsets;
+    CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
+    
+    NSDictionary<NSString *, NSArray<NSNumber *> *> *pos = @{
+        // Top Bar
+        @"MAP": @[ @(L + 25), @(T + 20) ],
+        @"ESC": @[ @(R - 25), @(T + 20) ],
+        @"FOOT": @[ @(S.width / 2 - 55), @(T + 20) ],
+        @"CAR": @[ @(S.width / 2), @(T + 20) ],
+        @"CIN": @[ @(S.width / 2 + 55), @(T + 20) ],
+        @"🎮": @[ @(S.width / 2 + 105), @(T + 20) ],
+        
+        // Foot Mode
+        @"FIRE": @[ @(R - 48), @(H - 105) ],
+        @"AIM": @[ @(R - 120), @(H - 145) ],
+        @"OS": @[ @(R - 48), @(H - 175) ],
+        @"SCAN": @[ @(R - 120), @(H - 85) ],
+        @"X": @[ @(R - 175), @(H - 120) ],
+        @"A": @[ @(R - 75), @(H - 42) ],
+        @"B": @[ @(R - 22), @(H - 42) ],
+        @"Y": @[ @(R - 170), @(H - 65) ],
+        @"RB": @[ @(R - 45), @(T + 72) ],
+        @"R3": @[ @(R - 105), @(T + 72) ],
+        
+        @"HEAL": @[ @(L + 95), @(H - 165) ],
+        @"PHONE": @[ @(L + 95), @(H - 22) ],
+        @"CALL": @[ @(L + 165), @(H - 95) ],
+        @"RADIO": @[ @(L + 25), @(H - 95) ],
+        
+        // Car Mode Cruising
+        @"GAS": @[ @(R - 50), @(H - 85) ],
+        @"BRAKE": @[ @(L + 50), @(H - 85) ],
+        @"P": @[ @(R - 125), @(H - 55) ],
+        @"EXIT": @[ @(R - 45), @(T + 72) ],
+        @"GUN": @[ @(R - 125), @(H - 125) ],
+        @"CAM": @[ @(R - 110), @(T + 72) ],
+        @"CAR_RADIO": @[ @(L + 120), @(T + 72) ],
+        @"HORN": @[ @(L + 50), @(T + 72) ],
+        
+        // Car Armed Mode
+        @"CAR_FIRE": @[ @(R - 50), @(H - 90) ],
+        @"CAR_AIM": @[ @(R - 125), @(H - 140) ],
+        @"CAR_LOCK": @[ @(R - 50), @(H - 160) ],
+        @"CAR_X": @[ @(R - 175), @(H - 90) ],
+        @"HOLSTER": @[ @(R - 125), @(H - 80) ],
+        @"CAR_GAS_L": @[ @(L + 50), @(H - 90) ],
+        @"CAR_BRAKE_L": @[ @(L + 120), @(H - 90) ],
+        @"CAR_P_L": @[ @(R - 65), @(H - 35) ],
+        @"CAR_EXIT_L": @[ @(R - 45), @(T + 72) ],
+        
+        // Scanner Mode
+        @"SCAN_UP": @[ @(L + 65), @(H - 135) ],
+        @"SCAN_DOWN": @[ @(L + 65), @(H - 65) ],
+        @"SCAN_EXIT": @[ @(L + 135), @(H - 100) ],
+        @"SCAN_EXEC": @[ @(R - 55), @(H - 90) ],
+        @"SCAN_TAG": @[ @(R - 130), @(H - 140) ],
+        @"SCAN_TAB": @[ @(R - 130), @(H - 65) ],
+        
+        // Cutscene Mode
+        @"CIN_SKIP": @[ @(R - 55), @(H - 85) ],
+        @"CIN_OK": @[ @(R - 130), @(H - 85) ],
+        @"CIN_UP": @[ @(L + 65), @(H - 135) ],
+        @"CIN_DOWN": @[ @(L + 65), @(H - 65) ],
     };
-    _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no right stick: swipe on the right half to look */
+    
+    _lHome = CGPointMake(L + 95, H - 95);
+    
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (MSCtl *c in _ctls) {
-        NSArray *p = pos[c.label]; c.center = CGPointMake([p[0] doubleValue], [p[1] doubleValue]); c.r = [p[2] doubleValue];
-        c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
-        CGFloat fs = c.label.length > 2 ? 9 : c.r < 20 ? 11 : 14; c.text.fontSize = fs; c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.62, 2 * c.r, fs * 1.3);
-        c.text.string = c.label; [self msPaint:c];
+        NSArray *coord = pos[c.label];
+        if (coord) {
+            c.center = CGPointMake([coord[0] doubleValue], [coord[1] doubleValue]);
+        }
+        if (c.isPill) {
+            c.shape.path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(c.center.x - c.pillSize.width/2, c.center.y - c.pillSize.height/2, c.pillSize.width, c.pillSize.height) cornerRadius:c.pillSize.height/2].CGPath;
+            c.text.frame = CGRectMake(c.center.x - c.pillSize.width/2, c.center.y - 7, c.pillSize.width, 14);
+            c.text.string = c.label;
+        } else {
+            c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
+            if (c.icon) {
+                c.icon.frame = CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r);
+            }
+            CGFloat fs = c.r > 24 ? 12 : 10;
+            c.text.fontSize = fs;
+            c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.6, 2 * c.r, fs * 1.3);
+            if (!c.icon) c.text.string = c.label;
+        }
+        [self msPaint:c];
     }
-    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
-    _rBase.hidden = _rKnob.hidden = YES;
+    
+    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:40];
     [CATransaction commit];
 }
+
 - (void)msDrawStick:(CAShapeLayer *)b knob:(CAShapeLayer *)k at:(CGPoint)p offset:(CGPoint)o r:(CGFloat)r {
+    BOOL showStick = !_hiddenByUser && (_currentMode != MSModeScanner && _currentMode != MSModeCutscene);
+    b.hidden = k.hidden = !showStick;
+    if (!showStick) return;
     b.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)].CGPath;
-    k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - 24, p.y + o.y - 24, 48, 48)].CGPath;
-    b.hidden = k.hidden = _hiddenByUser;
+    k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - 20, p.y + o.y - 20, 40, 40)].CGPath;
+    k.fillColor = _sprinting ? [CP_YELLOW colorWithAlphaComponent:0.65].CGColor : [UIColor colorWithWhite:1 alpha:0.4].CGColor;
 }
-- (BOOL)msNear:(CGPoint)p to:(CGPoint)c r:(CGFloat)r { CGFloat dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy <= r * r; }
+
 - (void)msPaint:(MSCtl *)c {
-    BOOL on = c.touch != nil, hide = c.kind != MSCtlToggle && _hiddenByUser;
-    c.shape.hidden = c.text.hidden = hide;
-    c.shape.fillColor = [UIColor colorWithWhite:1 alpha:on ? 0.45 : 0.12].CGColor;
-    c.shape.strokeColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
-    if (c.kind == MSCtlToggle) c.shape.opacity = c.text.opacity = _hiddenByUser ? 0.4 : 1;
+    BOOL on = c.touch != nil;
+    BOOL isModePillActive = (c.kind == MSCtlModeSelect && c.targetMode == _currentMode);
+    BOOL visible = !_hiddenByUser && ((c.modeMask & (1 << _currentMode)) != 0);
+    
+    c.shape.hidden = !visible;
+    if (c.icon) c.icon.hidden = !visible;
+    if (c.text) c.text.hidden = !visible || (c.icon && !c.isPill);
+    if (!visible) return;
+    
+    UIColor *baseCol = c.accentColor ?: UIColor.whiteColor;
+    if (isModePillActive) {
+        c.shape.strokeColor = CP_YELLOW.CGColor;
+        c.shape.fillColor = [CP_YELLOW colorWithAlphaComponent:0.5].CGColor;
+        c.shape.lineWidth = 2.0;
+    } else {
+        c.shape.strokeColor = [baseCol colorWithAlphaComponent:on ? 0.95 : 0.45].CGColor;
+        c.shape.fillColor = [baseCol colorWithAlphaComponent:on ? 0.55 : 0.15].CGColor;
+        c.shape.lineWidth = on ? 2.0 : 1.5;
+    }
+    
+    if (c.kind == MSCtlToggleHUD) {
+        c.shape.opacity = c.text.opacity = _hiddenByUser ? 0.4 : 1.0;
+    }
 }
+
 - (MSCtl *)msCtlAt:(CGPoint)p {
+    if (_hiddenByUser) {
+        for (MSCtl *c in _ctls) if (c.kind == MSCtlToggleHUD) {
+            CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y;
+            if (dx * dx + dy * dy <= (c.r + 10) * (c.r + 10)) return c;
+        }
+        return nil;
+    }
+    int curBit = (1 << _currentMode);
     for (MSCtl *c in _ctls) {
-        if (_hiddenByUser && c.kind != MSCtlToggle) continue;
-        CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
-        if (dx * dx + dy * dy <= r * r) return c;
+        if ((c.modeMask & curBit) == 0) continue;
+        if (c.isPill) {
+            CGFloat halfW = c.pillSize.width / 2.0 + 6, halfH = c.pillSize.height / 2.0 + 6;
+            if (fabs(p.x - c.center.x) <= halfW && fabs(p.y - c.center.y) <= halfH) return c;
+        } else {
+            CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
+            if (dx * dx + dy * dy <= r * r) return c;
+        }
     }
     return nil;
 }
-/* empty screen: in gameplay it's ours (stick / camera); in menus it falls through to the game as a mouse click */
+
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     if (self.hidden) return nil;
     if ([self msCtlAt:p]) return self;
     if (_hiddenByUser) return nil;
-    /* the drawn sticks always work (the game doesn't reliably lock the pointer or hide the cursor in gameplay); a quick
-       tap on one in a menu is passed on to the game as a click, so menu items under them stay usable */
-    if ([self msNear:p to:_lHome r:85] || [self msNear:p to:_rHome r:80]) return self;
-    return g_pointerLocked ? self : nil;
+    return self;
 }
+
 - (void)msSyncDpad {
-    int x = 0, y = 0; for (MSCtl *c in _ctls) if (c.touch) { x += c.dpadX; y += c.dpadY; }
+    int x = 0, y = 0;
+    for (MSCtl *c in _ctls) if (c.touch) { x += c.dpadX; y += c.dpadY; }
     MSPadSetStick(g_pad.dpad, x, y);
 }
+
+- (void)msPress:(MSCtl *)c touch:(UITouch *)t {
+    c.touch = t;
+    if (c.kind == MSCtlToggleHUD) {
+        _hiddenByUser = !_hiddenByUser;
+        [self msUpdateLayout];
+        return;
+    }
+    if (c.kind == MSCtlModeSelect) {
+        _currentMode = c.targetMode;
+        [self msUpdateLayout];
+        return;
+    }
+    if (c.kind == MSCtlScannerToggle) {
+        if (_currentMode == MSModeScanner) {
+            _currentMode = MSModeFoot;
+            MSPadSetButton(g_pad.leftShoulder, 0);
+        } else {
+            _currentMode = MSModeScanner;
+            MSPadSetButton(g_pad.leftShoulder, 1);
+        }
+        [self msUpdateLayout];
+        return;
+    }
+    if (c.kind == MSCtlCarWeaponToggle) {
+        if (_currentMode == MSModeCar) _currentMode = MSModeCarArmed;
+        else if (_currentMode == MSModeCarArmed) _currentMode = MSModeCar;
+        MSPadSetButton(c.button, 1);
+        MSAfter(0.12, ^{ MSPadSetButton(c.button, 0); });
+        [self msUpdateLayout];
+        return;
+    }
+    if (c.kind == MSCtlHoldAction) {
+        MSPadSetButton(c.button, 1);
+        c.isHoldTriggered = NO;
+        MSAfter(0.8, ^{
+            if (c.touch == t) {
+                c.isHoldTriggered = YES;
+                MSPadSetButton(c.button, 0);
+                if (self->_currentMode == MSModeCar || self->_currentMode == MSModeCarArmed) {
+                    self->_currentMode = MSModeFoot;
+                    [self msUpdateLayout];
+                }
+            }
+        });
+        [self msPaint:c];
+        return;
+    }
+    if (c.kind == MSCtlCombo) {
+        MSPadSetButton(c.button, 1);
+        MSPadSetButton(c.button2, 1);
+        [self msPaint:c];
+        return;
+    }
+    if (c.button) MSPadSetButton(c.button, 1);
+    if (c.dpadX || c.dpadY) [self msSyncDpad];
+    if (c.key) MSKey((GCKeyCode)c.key, YES);
+    [self msPaint:c];
+}
+
+- (void)msRelease:(MSCtl *)c {
+    c.touch = nil;
+    if (c.kind == MSCtlCombo) {
+        MSPadSetButton(c.button, 0);
+        MSPadSetButton(c.button2, 0);
+    } else if (c.kind == MSCtlHoldAction) {
+        MSPadSetButton(c.button, 0);
+    } else {
+        if (c.button) MSPadSetButton(c.button, 0);
+        if (c.dpadX || c.dpadY) [self msSyncDpad];
+        if (c.key) MSKey((GCKeyCode)c.key, NO);
+    }
+    [self msPaint:c];
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     for (UITouch *t in ts) {
-        CGPoint p = [t locationInView:self]; MSCtl *c = [self msCtlAt:p];
-        if (c && c.kind == MSCtlToggle) {
-            _hiddenByUser = !_hiddenByUser; [CATransaction begin]; [CATransaction setDisableActions:YES];
-            for (MSCtl *x in _ctls) [self msPaint:x];
-            _stickBase.hidden = _stickKnob.hidden = _rBase.hidden = _rKnob.hidden = _hiddenByUser;
-            [CATransaction commit]; continue;
-        }
+        CGPoint p = [t locationInView:self];
+        MSCtl *c = [self msCtlAt:p];
         if (c) {
-            c.touch = t; MSPadSetButton(c.button, 1); if (c.dpadX || c.dpadY) [self msSyncDpad]; if (c.key) MSKey((GCKeyCode)c.key, YES);
-            [self msPaint:c]; continue;
+            [self msPress:c touch:t];
+            continue;
         }
-        if (!_rTouch && [self msNear:p to:_rHome r:80]) { _rTouch = t; _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0; [self msRightStick:p]; continue; }
+        
+        // Left side touch: Dynamic Stick
         if (p.x < self.bounds.size.width * 0.45) {
+            if (_currentMode == MSModeScanner || _currentMode == MSModeCutscene) continue;
             if (_moveTouch) continue;
-            _moveTouch = t; _moveOrigin = [self msNear:p to:_lHome r:85] ? _lHome : p;   /* on the stick: centred; elsewhere: it follows the thumb */
-            _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0;
+            _moveTouch = t;
+            _moveOrigin = p;
+            _stickT0 = t.timestamp;
+            _stickP0 = p;
+            _stickMax = 0;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:40];
             [CATransaction commit];
             [self msLeftStick:p];
-        } else if (!_lookTouch) { _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0; }
+        } else {
+            // Right side touch: Camera Look
+            if (!_lookTouch) {
+                _lookTouch = t;
+                _lookLast = p;
+                _lookT = t.timestamp;
+                _lookMoved = g_lookFingerAt = CACurrentMediaTime();
+            }
+        }
     }
 }
+
 - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self];
-        if (t == _moveTouch || t == _rTouch) _stickMax = MAX(_stickMax, hypot(p.x - _stickP0.x, p.y - _stickP0.y));
-        if (t == _moveTouch) [self msLeftStick:p];
-        else if (t == _rTouch) [self msRightStick:p];
-        else if (t == _lookTouch) {
-            /* camera: finger speed -> right stick, from the touch's own timestamps (touches arrive once per game
-               frame; per-display-frame sampling gave a spike and then zeros = jerky camera); ~700 pt/s is full */
-            {   /* camera swipe: finger movement is collected (coalesced touches, full touch rate) and handed to the game once
-                   per game frame - as the right stick (default) or as mouse motion (LookMode = mouse) */
-                static double scale; if (!scale) scale = MSCfgD(@"LookMouseScale", 2.0) * MSLookSensitivity();
-                double k = g_lookStick ? 1 : scale * _lookSpeed;
-                CGPoint q = p; NSArray *cs = [e coalescedTouchesForTouch:t]; if (cs.count) q = [cs.lastObject locationInView:self];
-                MSLookAdd(CGPointMake((q.x - _lookLast.x) * k, (q.y - _lookLast.y) * k));
-                _lookLast = q; _lookT = t.timestamp; _lookMoved = g_lookFingerAt = CACurrentMediaTime();
-                continue;
-            }
-        } else {                                              /* a finger that slid off its button lets go of it */
-            for (MSCtl *c in [_ctls copy]) if (c.touch == t && c.kind == MSCtlButton) {
-                CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 24;
-                if (dx * dx + dy * dy > r * r) [self msRelease:c];
+        if (t == _moveTouch) {
+            [self msLeftStick:p];
+        } else if (t == _lookTouch) {
+            static double scale; if (!scale) scale = MSCfgD(@"LookMouseScale", 2.0) * MSLookSensitivity();
+            double k = g_lookStick ? 1 : scale * _lookSpeed;
+            CGPoint q = p;
+            NSArray *cs = [e coalescedTouchesForTouch:t];
+            if (cs.count) q = [cs.lastObject locationInView:self];
+            MSLookAdd(CGPointMake((q.x - _lookLast.x) * k, (q.y - _lookLast.y) * k));
+            _lookLast = q;
+            _lookT = t.timestamp;
+            _lookMoved = g_lookFingerAt = CACurrentMediaTime();
+        } else {
+            for (MSCtl *c in [_ctls copy]) {
+                if (c.touch == t && c.kind != MSCtlToggleHUD) {
+                    CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y;
+                    CGFloat maxDist = (c.isPill ? c.pillSize.width : c.r) + 24;
+                    if (dx * dx + dy * dy > maxDist * maxDist) [self msRelease:c];
+                }
             }
         }
     }
 }
-- (void)msWASD:(int)want {                       /* bit 0 W, 1 A, 2 S, 3 D */
+
+- (void)msLeftStick:(CGPoint)p {
+    CGFloat dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy);
+    CGFloat r = 40.0;
+    CGFloat k = len > r ? r / len : 1.0;
+    float sx = dx * k / r, sy = -dy * k / r;
+    MSPadSetStick(g_pad.leftThumbstick, sx, sy);
+    if (!g_pad) {
+        [self msWASD:(sy > 0.4) | (sx < -0.4) << 1 | (sy < -0.4) << 2 | (sx > 0.4) << 3];
+    }
+    
+    // Auto-sprint threshold when pushed past edge forward
+    BOOL shouldSprint = (_currentMode == MSModeFoot) && (len > r * 1.25) && (sy > 0.3);
+    if (shouldSprint != _sprinting) {
+        _sprinting = shouldSprint;
+        MSPadSetButton(g_pad.leftThumbstickButton, shouldSprint ? 1 : 0);
+    }
+    
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    CGFloat knobK = len > r * 1.3 ? (r * 1.3) / len : 1.0;
+    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * knobK, dy * knobK) r:r];
+    [CATransaction commit];
+}
+
+- (void)msWASD:(int)want {
     GCKeyCode keys[4] = { GCKeyCodeKeyW, GCKeyCodeKeyA, GCKeyCodeKeyS, GCKeyCodeKeyD };
     for (int i = 0; i < 4; i++) if (((want ^ _wasd) >> i) & 1) MSKey(keys[i], (want >> i) & 1);
     _wasd = want;
 }
-- (void)msLeftStick:(CGPoint)p {
-    CGFloat dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy), k = len > 60 ? 60 / len : 1;
-    MSPadSetStick(g_pad.leftThumbstick, dx * k / 60, -dy * k / 60);
-    if (!g_pad) { float x = dx * k / 60, y = -dy * k / 60; [self msWASD:(y > 0.4) | (x < -0.4) << 1 | (y < -0.4) << 2 | (x > 0.4) << 3]; }
-    [CATransaction begin]; [CATransaction setDisableActions:YES];
-    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * k, dy * k) r:60];
-    [CATransaction commit];
-}
-- (void)msRightStick:(CGPoint)p {
-    CGFloat dx = p.x - _rHome.x, dy = p.y - _rHome.y, len = hypot(dx, dy), k = len > 55 ? 55 / len : 1;
-    MSPadSetStick(g_pad.rightThumbstick, dx * k / 55, -dy * k / 55);
-    [CATransaction begin]; [CATransaction setDisableActions:YES];
-    [self msDrawStick:_rBase knob:_rKnob at:_rHome offset:CGPointMake(dx * k, dy * k) r:55];
-    [CATransaction commit];
-}
-- (void)msRelease:(MSCtl *)c { c.touch = nil; MSPadSetButton(c.button, 0); if (c.key) MSKey((GCKeyCode)c.key, NO); if (c.dpadX || c.dpadY) [self msSyncDpad]; [self msPaint:c]; }
+
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     for (UITouch *t in ts) {
-        if ((t == _moveTouch || t == _rTouch) && !g_pointerLocked && t.timestamp - _stickT0 < 0.25 && _stickMax < 12) {
-            MSHostView *h = g_hostView; CGPoint q = MSTouchIn(t, h);     /* quick tap on a stick in a menu: a click */
-            if (h) [h msClick:q right:NO];
-        }
         if (t == _moveTouch) {
-            _moveTouch = nil; MSPadSetStick(g_pad.leftThumbstick, 0, 0); [self msWASD:0];
+            _moveTouch = nil;
+            if (_sprinting) {
+                _sprinting = NO;
+                MSPadSetButton(g_pad.leftThumbstickButton, 0);
+            }
+            MSPadSetStick(g_pad.leftThumbstick, 0, 0);
+            [self msWASD:0];
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:40];
             [CATransaction commit];
-        } else if (t == _rTouch) {
-            _rTouch = nil; MSPadSetStick(g_pad.rightThumbstick, 0, 0);
-            [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_rBase knob:_rKnob at:_rHome offset:CGPointZero r:55];
-            [CATransaction commit];
-        } else if (t == _lookTouch) { _lookTouch = nil; _lookX = _lookY = 0; g_lookFingerAt = 0; }   /* the stick eases back in MSLookFlushStick */
-        for (MSCtl *c in _ctls) if (c.touch == t) [self msRelease:c];
+        } else if (t == _lookTouch) {
+            _lookTouch = nil;
+            g_lookFingerAt = 0;
+        }
+        for (MSCtl *c in _ctls) {
+            if (c.touch == t) [self msRelease:c];
+        }
     }
 }
-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    [self touchesEnded:ts withEvent:e];
+}
+
 - (void)msTick:(CADisplayLink *)l {
     BOOL want = g_frames > 60 && !(g_vpad ? g_realPad : MSRealControllerConnected()) && !g_gcmCount;
     if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); }
     if (!want) return;
     [self msLayout];
-    float op = (g_pointerLocked || g_cursorHidden || _moveTouch || _rTouch) ? 1 : 0.35;    /* sticks dimmed in menus */
-    if (_stickBase.opacity != op) { [CATransaction begin]; [CATransaction setDisableActions:YES];
-        _stickBase.opacity = _stickKnob.opacity = _rBase.opacity = _rKnob.opacity = op; [CATransaction commit]; }
-    /* camera look is driven from touchesMoved; here it only stops when the finger rests */
-    double now = CACurrentMediaTime();
-    (void)now;
+    float op = (g_pointerLocked || g_cursorHidden || _moveTouch) ? 1.0 : 0.4;
+    if (_stickBase.opacity != op) {
+        [CATransaction begin]; [CATransaction setDisableActions:YES];
+        _stickBase.opacity = _stickKnob.opacity = op;
+        [CATransaction commit];
+    }
 }
 @end
 
